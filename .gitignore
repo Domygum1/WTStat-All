@@ -4,4 +4,5 @@ __pycache__/
 config.local.json
 data/*.sqlite3*
 cache/replays/
+work/
 *.part

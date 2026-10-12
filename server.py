@@ -7,7 +7,6 @@ import io
 import json
 import math
 import sqlite3
-import sys
 import threading
 import time
 import tempfile
@@ -24,22 +23,15 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 ROOT = Path(__file__).resolve().parent
-SOURCE = ROOT.parent / "WTStat"
-if not (SOURCE / "app.py").exists():
-    raise RuntimeError(f"需要原 WTStat 项目：{SOURCE}")
-sys.path.insert(0, str(SOURCE))
-import app as wt  # Reuse the maintained WRPL parser, Wiki mapping and BR rules.
+import replay_core as wt
 
-# Load Wiki data from WTStat before redirecting all database/cache writes here.
 if not wt.wiki_catalog():
-    raise RuntimeError("WTStat 的 Wiki 载具表不可用；先启动或更新原项目。")
+    raise RuntimeError("缺少本目录 data/wiki_vehicles.csv 或载具表无效。")
+if not wt.PARSER.is_file():
+    raise RuntimeError("缺少本目录 bin/wtstat_results.exe。")
 DB = ROOT / "data" / "wtstat_all.sqlite3"
 BATTLE_DB = ROOT / "data" / "battles.sqlite3"
 CACHE = ROOT / "cache" / "replays"
-wt.DB = DB
-wt.REPLAYS = CACHE
-if (ROOT / "config.local.json").exists():
-    wt.CONFIG = ROOT / "config.local.json"
 
 app = FastAPI(title="WTStat all")
 GROUPS = {"aircraft": "air", "tank": "ground"}
@@ -98,7 +90,10 @@ def init_db() -> None:
     DB.parent.mkdir(parents=True, exist_ok=True)
     CACHE.mkdir(parents=True, exist_ok=True)
     for partial in CACHE.glob("*/*.part"):
-        partial.unlink(missing_ok=True)
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass  # A running sampler may still be writing this part.
     with db() as connection:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA battle.journal_mode=WAL")
@@ -494,7 +489,7 @@ def process_replay(item: dict) -> None:
         data["battle_group"] = item["statisticGroup"]
         added_samples = 0
         with db() as connection:
-            wt.add_battle_ratings(sid, data, connection)
+            wt.add_battle_ratings(data)
             match_br = data.get("match_br")
             team_summary = json.dumps(team_br_summary(data["players"], mode))
             teammate_countries = squad_countries(data["players"])
@@ -688,7 +683,7 @@ def index():
 
 @app.get("/fonts/wt-symbols.ttf")
 def wt_symbols_font():
-    return FileResponse(SOURCE / "static" / "fonts" / "symbols_skyquake.bfc9728c6a6bc73f209a.ttf",
+    return FileResponse(ROOT / "static" / "fonts" / "symbols_skyquake.bfc9728c6a6bc73f209a.ttf",
                         media_type="font/ttf", headers={"Cache-Control": "public, max-age=86400"})
 
 
@@ -703,7 +698,7 @@ def control(payload: Control):
     with guard:
         if payload.running:
             if not wt.cookie():
-                raise HTTPException(401, "需要 identity_sid；请配置本目录或 WTStat 的 config.local.json。")
+                raise HTTPException(401, "需要 identity_sid；请配置本目录的 config.local.json。")
             if worker_thread and worker_thread.is_alive():
                 if runtime["stopping"]:
                     raise HTTPException(409, "正在停止当前任务，请稍后重新启动。")

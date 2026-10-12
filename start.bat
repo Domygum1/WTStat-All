@@ -2,11 +2,6 @@
 setlocal
 cd /d "%~dp0"
 title WTStat ALL - Replay Sampler - Port 8767
-set "PYTHON_EXE=%~dp0..\WTStat\.venv\Scripts\python.exe"
-if exist "%PYTHON_EXE%" (
-  "%PYTHON_EXE%" -c "import fastapi,uvicorn,requests" >nul 2>nul
-  if not errorlevel 1 goto :ready
-)
 set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
 if not exist "%PYTHON_EXE%" (
   python -m venv .venv
@@ -17,9 +12,12 @@ if errorlevel 1 (
   "%PYTHON_EXE%" -m pip install -r requirements.txt
   if errorlevel 1 goto :fail
 )
-:ready
-if not exist "..\WTStat\bin\wtstat_results.exe" (
-  echo Missing WTStat parser. Run ..\WTStat\start.bat first.
+if not exist "bin\wtstat_results.exe" (
+  echo Missing local Replay parser: bin\wtstat_results.exe
+  goto :fail
+)
+if not exist "data\wiki_vehicles.csv" (
+  echo Missing local vehicle catalog: data\wiki_vehicles.csv
   goto :fail
 )
 echo WTStat all: http://127.0.0.1:8767

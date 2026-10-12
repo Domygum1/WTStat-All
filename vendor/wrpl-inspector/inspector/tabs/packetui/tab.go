@@ -1,0 +1,288 @@
+/*
+	wrpl-inspector: War Thunder replay inspection software
+	Copyright (C) 2025 flexcoral
+
+	This program is free software: you can redistribute it and/or modify
+	it under the terms of the GNU Affero General Public License as published
+	by the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	This program is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+	GNU Affero General Public License for more details.
+
+	You should have received a copy of the GNU Affero General Public License
+	along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+package tabPacket
+
+import (
+	"encoding/hex"
+	"fmt"
+	"regexp"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/AllenDang/cimgui-go/imgui"
+	"github.com/maxsupermanhd/wrpl-inspector/v3/inspector"
+	"github.com/maxsupermanhd/wrpl-inspector/v3/inspector/imui"
+	"github.com/maxsupermanhd/wrpl-inspector/v3/wrpl/packet"
+)
+
+func NewPacketsTab(rpl *inspector.LoadedReplay, additionalStreams ...packet.PacketStreamProvider) *PacketsTab {
+	tab := &PacketsTab{
+		rpl:             rpl,
+		StreamProviders: additionalStreams,
+		filterNeeded:    true,
+	}
+	return tab
+}
+
+func (tab *PacketsTab) Name() string {
+	return "Packets"
+}
+
+func (tab *PacketsTab) Init() {
+	tab.s = inspector.NewPacketStreamSelector(append([]packet.PacketStreamProvider{tab.rpl.GlobalStreamProvider()}, tab.StreamProviders...)...)
+
+	tab.filterParserAvailableNames = []string{}
+	for _, p := range tab.rpl.Parsers {
+		tab.filterParserAvailableNames = append(tab.filterParserAvailableNames, p.Name())
+	}
+	slices.Sort(tab.filterParserAvailableNames)
+	tab.filterParserSelections = make([]bool, len(tab.filterParserAvailableNames))
+}
+
+type FilterParserSettings struct {
+	ErrorsDoFilter  bool
+	ErrorsCsPresent bool
+	ResultDoFilter  bool
+	ResultCsPresent bool
+	Names           []string
+}
+
+type PacketsTab struct {
+	rpl *inspector.LoadedReplay
+
+	s               *inspector.PacketStreamSelector
+	StreamProviders []packet.PacketStreamProvider
+
+	FilterInput                FilterInput
+	FilterMode                 FilterMode
+	FilterConstraint           string
+	FilterType                 int32
+	FilterTypeEnable           bool
+	FilterParserResults        FilterParserSettings
+	filterParserAvailableNames []string
+	filterParserSelections     []bool
+	filterNeeded               bool
+	filterError                error
+	filterTook                 time.Duration
+
+	UISaveLoadFilter func() bool
+
+	view PacketStreamView
+}
+
+func (tab *PacketsTab) Run() {
+
+	imgui.AlignTextToFramePadding()
+	imgui.TextUnformatted("Inspecting")
+	imgui.SameLine()
+	imui.FlagUpdate(&tab.filterNeeded, tab.s.Show())
+	imgui.SameLine()
+	imgui.AlignTextToFramePadding()
+	imgui.TextUnformatted(fmt.Sprintf("Total: %d Showing: %d (%.2f%%) (filtered in %s)",
+		len(tab.s.Stream()),
+		len(tab.view.Stream),
+		(float64(len(tab.view.Stream))/float64(len(tab.s.Stream())))*100,
+		tab.filterTook.Round(time.Millisecond).String()))
+
+	imui.FlagUpdate(&tab.filterNeeded, imui.ImAutoCombo("Input", &tab.FilterInput))
+
+	imgui.SameLine()
+	imui.FlagUpdate(&tab.filterNeeded, imui.ImAutoCombo("Mode", &tab.FilterMode))
+
+	imgui.SameLine()
+	imgui.TextUnformatted("Type")
+	imgui.SameLine()
+	imui.FlagUpdate(&tab.filterNeeded, imgui.Checkbox("##typeEnable", &tab.FilterTypeEnable))
+	imgui.SameLine()
+	imgui.SetNextItemWidth(100)
+	imui.FlagUpdate(&tab.filterNeeded, imgui.InputInt("##typeValue", &tab.FilterType))
+
+	imgui.SameLine()
+	if imgui.Button("Filter by parser") {
+		imgui.OpenPopupStr("popupFilterParserSettings")
+	}
+	if imgui.BeginPopup("popupFilterParserSettings") {
+		imgui.AlignTextToFramePadding()
+		if imgui.Button("Parser name") {
+			imgui.OpenPopupStr("parserFilterPopup")
+		}
+		if imgui.BeginPopup("parserFilterPopup") {
+			needsUpdate := false
+			for i, parserName := range tab.filterParserAvailableNames {
+				if imgui.MenuItemBoolPtr(parserName, "", &tab.filterParserSelections[i]) {
+					needsUpdate = true
+				}
+			}
+			if needsUpdate {
+				tab.filterNeeded = true
+				tab.FilterParserResults.Names = []string{}
+				for i, parserName := range tab.filterParserAvailableNames {
+					if tab.filterParserSelections[i] {
+						tab.FilterParserResults.Names = append(tab.FilterParserResults.Names, parserName)
+					}
+				}
+			}
+			imgui.EndPopup()
+		}
+
+		imui.FlagUpdate(&tab.filterNeeded, imgui.Checkbox("Filter on error", &tab.FilterParserResults.ErrorsDoFilter))
+		if tab.FilterParserResults.ErrorsDoFilter {
+			imui.FlagUpdate(&tab.filterNeeded, imgui.Checkbox("Error present", &tab.FilterParserResults.ErrorsCsPresent))
+		}
+		imui.FlagUpdate(&tab.filterNeeded, imgui.Checkbox("Filter on results", &tab.FilterParserResults.ResultDoFilter))
+		if tab.FilterParserResults.ResultDoFilter {
+			imui.FlagUpdate(&tab.filterNeeded, imgui.Checkbox("Result present", &tab.FilterParserResults.ResultCsPresent))
+		}
+		imgui.EndPopup()
+	}
+
+	imui.FlagUpdate(&tab.filterNeeded, imgui.InputTextWithHint("##filterConstraint", "^025858f0", &tab.FilterConstraint, 0, func(data imgui.InputTextCallbackData) int {
+		tab.filterNeeded = true
+		return 0
+	}))
+	if tab.UISaveLoadFilter != nil {
+		if tab.UISaveLoadFilter() {
+			tab.filterNeeded = true
+		}
+	}
+
+	if tab.filterNeeded {
+		tab.filterNeeded = false
+		t := time.Now()
+		tab.filterError = tab.filter()
+		tab.view.UpdateIndex()
+		tab.filterTook = time.Since(t)
+	}
+
+	tab.view.Run()
+}
+
+//go:generate stringer -type FilterMode
+type FilterMode int
+
+const (
+	FilterModeRegex FilterMode = iota
+	FilterModeContains
+)
+
+//go:generate stringer -type FilterInput
+type FilterInput int
+
+const (
+	FilterInputHex FilterInput = iota
+	FilterInputBin
+	FilterInputLiteral
+)
+
+func (tab *PacketsTab) filter() error {
+	var filterMatcherFn func(input []byte) (matches bool)
+	switch tab.FilterMode {
+	case FilterModeContains:
+		filterMatcherFn = func(input []byte) (matches bool) {
+			return strings.Contains(string(input), tab.FilterConstraint)
+		}
+	case FilterModeRegex:
+		re, err := regexp.Compile(tab.FilterConstraint)
+		if err != nil {
+			return err
+		}
+		filterMatcherFn = re.Match
+	}
+
+	var filterInputFn func(pk packet.ParsedPacket) (input []byte)
+	switch tab.FilterInput {
+	case FilterInputHex:
+		filterInputFn = func(pk packet.ParsedPacket) (input []byte) {
+			return []byte(hex.EncodeToString(pk.PacketPayload))
+		}
+	case FilterInputBin:
+		filterInputFn = func(pk packet.ParsedPacket) (input []byte) {
+			b := &strings.Builder{}
+			for _, v := range pk.PacketPayload {
+				fmt.Fprintf(b, "%08b", v)
+			}
+			return []byte(b.String())
+		}
+	case FilterInputLiteral:
+		filterInputFn = func(pk packet.ParsedPacket) (input []byte) {
+			return pk.PacketPayload
+		}
+	}
+
+	tab.view.Stream = tab.view.Stream[:0]
+
+filterLoop:
+	for _, pk := range tab.s.Stream() {
+		if tab.FilterTypeEnable {
+			if pk.PacketType != byte(tab.FilterType) {
+				continue
+			}
+		}
+		if tab.FilterParserResults.ErrorsDoFilter {
+			if tab.FilterParserResults.ErrorsCsPresent {
+				found := false
+				for _, res := range pk.ParsersResults {
+					if res.Err != nil {
+						found = true
+						break
+					}
+				}
+				if found == false {
+					continue
+				}
+			} else {
+				for _, res := range pk.ParsersResults {
+					if res.Err != nil {
+						continue filterLoop
+					}
+				}
+			}
+		}
+		if tab.FilterParserResults.ResultDoFilter {
+			if tab.FilterParserResults.ResultCsPresent {
+				if len(pk.ParsersResults) == 0 {
+					continue
+				}
+			} else {
+				if len(pk.ParsersResults) != 0 {
+					continue
+				}
+			}
+		}
+		if len(tab.FilterParserResults.Names) > 0 {
+			found := false
+			for _, p := range pk.ParsersResults {
+				if slices.Contains(tab.FilterParserResults.Names, p.Parser) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+		if !filterMatcherFn(filterInputFn(pk)) {
+			continue
+		}
+		tab.view.Stream = append(tab.view.Stream, pk)
+	}
+
+	return nil
+}
