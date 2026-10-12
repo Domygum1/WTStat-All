@@ -35,7 +35,9 @@ class StandaloneTest(unittest.TestCase):
             script = """
 import replay_core
 import server
+import csv
 import sqlite3
+from pathlib import Path
 
 assert replay_core.wiki_catalog()
 assert replay_core.cookie() is None
@@ -47,6 +49,10 @@ assert data["match_br"] == player["squad_br"] == 2.7
 assert server.index().path.is_file()
 assert server.wt_symbols_font().path.is_file()
 assert server.status()["cookie_configured"] is False
+assert server.is_real_player("123", "notrobot_1")
+assert not server.is_real_player("-12", "player")
+assert not server.is_real_player("0", "player")
+assert not server.is_real_player("123", "COOP/bot512")
 with sqlite3.connect(":memory:") as connection:
     connection.execute("CREATE TABLE samples (sid TEXT,uid TEXT,player_name TEXT,"
                        "country TEXT,squad_br REAL,squad_countries TEXT,party_key TEXT,"
@@ -62,6 +68,36 @@ with sqlite3.connect(":memory:") as connection:
     ])
     rows = list(server.player_csv_rows(connection))
     assert [row[1] for row in rows[1:]] == ["123", "124", "125"]
+with server.db() as connection:
+    connection.executemany(
+        "INSERT INTO samples(sid,uid,player_name,mode,squad_br,match_br) VALUES(?,?,?,?,?,?)",
+        [("a", "123", "notrobot_1", "air", 2.7, 2.7),
+         ("a", "-12", "player", "air", 2.7, 2.7),
+         ("a", "124", "coop/Bot56", "air", 2.7, 2.7)])
+server.runtime["samples"] = 3
+assert server.remove_saved_bots() == 2
+assert server.runtime["samples"] == 1
+with server.db() as connection:
+    assert [row[0] for row in connection.execute("SELECT uid FROM samples")] == ["123"]
+    assert connection.execute("SELECT SUM(count) FROM histogram").fetchone()[0] == 1
+
+fields = ("session_id", "uid", "player_name", "research_country", "squad_br",
+          "teammate_research_countries_json", "party_key", "configured_vehicles_json",
+          "stats_json", "team", "mode")
+path = Path("players.csv")
+with path.open("w", newline="", encoding="utf-8") as file:
+    writer = csv.DictWriter(file, fieldnames=fields)
+    writer.writeheader()
+    for uid, name in [("-13", "player"), ("0", "player"),
+                      ("125", "coop/Bot57"), ("126", "real_player")]:
+        writer.writerow({"session_id": "abcdef0123456789", "uid": uid,
+                         "player_name": name, "mode": "air"})
+result = server.import_csv_file(path)
+assert result["imported_samples"] == 1
+assert result["skipped_samples"] == 3
+with server.db() as connection:
+    assert [row[0] for row in connection.execute(
+        "SELECT uid FROM samples ORDER BY uid")] == ["123", "126"]
 """
             environment = os.environ.copy()
             environment.pop("PYTHONPATH", None)

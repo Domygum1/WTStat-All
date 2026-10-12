@@ -43,6 +43,8 @@ MAX_IMPORT_BYTES = 300_000_000
 NO_PLAYERS = "结算段未包含玩家数据"
 PLAYER_STAT_FIELDS = ("kills", "groundKills", "humanKills", "deaths", "assists", "score",
                       "aiKills", "aiGroundKills", "aiNavalKills", "captureZone", "teamKills")
+VALID_SAMPLE_SQL = ("uid <> '' AND uid NOT GLOB '*[^0-9]*' AND CAST(uid AS INTEGER)>0 "
+                    "AND (player_name IS NULL OR LOWER(player_name) NOT LIKE 'coop/bot%')")
 guard = threading.RLock()
 stop_event = threading.Event()
 active_sids: set[str] = set()
@@ -151,9 +153,6 @@ def init_db() -> None:
     runtime["page"] = setting("page", 1)
 
 
-init_db()
-
-
 def rating_tick(value, mode: str) -> int | None:
     if not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
@@ -162,6 +161,39 @@ def rating_tick(value, mode: str) -> int | None:
     if abs(value * 10 - tick) > 0.001 or not 10 <= tick <= limit or tick % 10 not in (0, 3, 7):
         return None
     return tick
+
+
+def is_real_player(uid: object, name: object) -> bool:
+    uid = str(uid)
+    return (uid.isascii() and uid.isdecimal() and int(uid) > 0
+            and not (isinstance(name, str) and name.lower().startswith("coop/bot")))
+
+
+def remove_saved_bots() -> int:
+    """Remove legacy bot samples and rebuild their derived histogram atomically."""
+    with db() as connection:
+        excluded = connection.execute(
+            f"SELECT COUNT(*) FROM samples WHERE NOT ({VALID_SAMPLE_SQL})").fetchone()[0]
+        if excluded:
+            connection.execute(f"DELETE FROM samples WHERE NOT ({VALID_SAMPLE_SQL})")
+            totals: Counter[tuple[str, str, int, int]] = Counter()
+            for row in connection.execute("SELECT mode,country,squad_br,match_br FROM samples"):
+                squad_tick = rating_tick(row["squad_br"], row["mode"])
+                match_tick = rating_tick(row["match_br"], row["mode"])
+                if squad_tick is not None and match_tick is not None:
+                    totals[(row["mode"], row["country"] or "", squad_tick, match_tick)] += 1
+            connection.execute("DELETE FROM histogram")
+            connection.executemany("INSERT INTO histogram VALUES(?,?,?,?,?)",
+                                   ((*key, count) for key, count in totals.items()))
+        remaining = connection.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+    runtime["samples"] = remaining
+    if excluded:
+        runtime["revision"] += 1
+    return excluded
+
+
+init_db()
+remove_saved_bots()
 
 
 def possible_ticks(mode: str) -> list[int]:
@@ -491,9 +523,11 @@ def process_replay(item: dict) -> None:
         with db() as connection:
             wt.add_battle_ratings(data)
             match_br = data.get("match_br")
-            team_summary = json.dumps(team_br_summary(data["players"], mode))
-            teammate_countries = squad_countries(data["players"])
-            for player in data["players"]:
+            real_players = [player for player in data["players"]
+                            if is_real_player(player.get("uid"), player.get("name"))]
+            team_summary = json.dumps(team_br_summary(real_players, mode))
+            teammate_countries = squad_countries(real_players)
+            for player in real_players:
                 country = player_country(player)
                 squad_br = player.get("squad_br")
                 cursor = connection.execute(
@@ -1231,9 +1265,7 @@ def player_csv_rows(connection: sqlite3.Connection):
     for row in connection.execute(
         "SELECT sid,uid,player_name,country,squad_br,squad_countries,party_key,"
         "configured_vehicles,stats_json,team FROM samples "
-        "WHERE uid NOT GLOB '*[^0-9]*' AND CAST(uid AS INTEGER)>0 "
-        "AND (player_name IS NULL OR LOWER(player_name) NOT LIKE 'coop/bot%') "
-        "ORDER BY sid,uid"):
+        f"WHERE {VALID_SAMPLE_SQL} ORDER BY sid,uid"):
         yield tuple(row)
 
 
@@ -1365,8 +1397,15 @@ def import_csv_file(path: Path) -> dict:
                     uid = row["uid"].strip()
                     if len(sid) != 16 or any(char not in "0123456789abcdef" for char in sid):
                         invalid(line, "Session ID 无效。")
+                    if uid.startswith("-") and uid[1:].isascii() and uid[1:].isdecimal():
+                        skipped_samples += 1
+                        continue
                     if not uid or len(uid) > 20 or not uid.isascii() or not uid.isdecimal():
                         invalid(line, "玩家 UID 无效。")
+                    name = row["player_name"] or None
+                    if not is_real_player(uid, name):
+                        skipped_samples += 1
+                        continue
                     if sid not in battle_cache:
                         battle_cache[sid] = connection.execute(
                             "SELECT * FROM battle.matches WHERE sid=?", (sid,)).fetchone()
@@ -1374,7 +1413,6 @@ def import_csv_file(path: Path) -> dict:
                     mode = (row.get("mode") or (battle["mode"] if battle else "") or "").strip()
                     if mode not in ("air", "ground"):
                         invalid(line, "缺少战局模式；请先导入战局 CSV。")
-                    name = row["player_name"] or None
                     country = row["research_country"] or None
                     party_key = row["party_key"] or None
                     if any(value is not None and len(value) > limit for value, limit in
