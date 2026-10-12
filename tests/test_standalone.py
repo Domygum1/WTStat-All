@@ -35,6 +35,7 @@ class StandaloneTest(unittest.TestCase):
             script = """
 import replay_core
 import server
+import sqlite3
 
 assert replay_core.wiki_catalog()
 assert replay_core.cookie() is None
@@ -46,6 +47,21 @@ assert data["match_br"] == player["squad_br"] == 2.7
 assert server.index().path.is_file()
 assert server.wt_symbols_font().path.is_file()
 assert server.status()["cookie_configured"] is False
+with sqlite3.connect(":memory:") as connection:
+    connection.execute("CREATE TABLE samples (sid TEXT,uid TEXT,player_name TEXT,"
+                       "country TEXT,squad_br REAL,squad_countries TEXT,party_key TEXT,"
+                       "configured_vehicles TEXT,stats_json TEXT,team INTEGER)")
+    connection.executemany("INSERT INTO samples(sid,uid,player_name) VALUES(?,?,?)", [
+        ("a", "123", "real_player"),
+        ("a", "124", "notrobot_1"),
+        ("a", "125", None),
+        ("a", "126", "coop/Bot344"),
+        ("a", "127", "COOP/bot512"),
+        ("a", "0", "unnamed"),
+        ("a", "-1", "unnamed"),
+    ])
+    rows = list(server.player_csv_rows(connection))
+    assert [row[1] for row in rows[1:]] == ["123", "124", "125"]
 """
             environment = os.environ.copy()
             environment.pop("PYTHONPATH", None)

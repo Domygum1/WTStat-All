@@ -30,3 +30,4 @@
 - CSV 拆为 `/api/export-battles.csv` 和 `/api/export.csv`；导入先战局 `/api/import-battles.csv`，再玩家 `/api/import.csv`。旧版玩家合并 CSV 兼容。
 - `/api/export-all.zip` 一键下载战局与玩家 CSV；ZIP 和内部 CSV 文件名均带 UTC 时间戳，临时 ZIP 发送后删除。
 - 2026-10-12：`WTStat all` 改为完全使用本目录的 Python 核心、Replay 解析器、Wiki 载具 CSV 与字体。启动脚本只创建和使用本目录 `.venv`，无需同级 WTStat 文件夹；独立目录导入、页面资源、状态和权重计算通过验证。
+- 2026-10-12：玩家 CSV（独立下载和 ZIP 内）过滤非正数 UID 与 `coop/Bot…`，保留名字偶含 bot 的真人；原始 SQLite 样本不删除。

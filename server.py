@@ -1230,7 +1230,10 @@ def player_csv_rows(connection: sqlite3.Connection):
            "stats_json", "team")
     for row in connection.execute(
         "SELECT sid,uid,player_name,country,squad_br,squad_countries,party_key,"
-        "configured_vehicles,stats_json,team FROM samples ORDER BY sid,uid"):
+        "configured_vehicles,stats_json,team FROM samples "
+        "WHERE uid NOT GLOB '*[^0-9]*' AND CAST(uid AS INTEGER)>0 "
+        "AND (player_name IS NULL OR LOWER(player_name) NOT LIKE 'coop/bot%') "
+        "ORDER BY sid,uid"):
         yield tuple(row)
 
 
