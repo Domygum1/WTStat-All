@@ -921,12 +921,12 @@ def party_distribution(mode: str, composition_filter: tuple[str, ...] | None,
         minima = {}
         for row in connection.execute(
             "SELECT s.sid, MIN(s.squad_br) AS minimum, COUNT(*) AS retained, "
-            "COUNT(s.squad_br) AS known, MAX(r.player_count) AS expected "
-            "FROM samples s JOIN replays r ON r.sid=s.sid WHERE s.mode=?" +
+            "COUNT(s.squad_br) AS known "
+            "FROM samples s WHERE s.mode=?" +
             time_clause + " GROUP BY s.sid", (mode, *time_params)
         ):
             minima[row["sid"]] = (rating_tick(row["minimum"], mode)
-                                  if row["retained"] == row["known"] == row["expected"] else None)
+                                  if row["retained"] == row["known"] else None)
         rows = connection.execute(
             "SELECT s.sid,s.country,s.squad_br,s.match_br,s.squad_countries,s.party_key "
             "FROM samples s WHERE s.mode=?" + time_clause, (mode, *time_params))

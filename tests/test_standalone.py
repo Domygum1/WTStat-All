@@ -98,6 +98,19 @@ assert result["skipped_samples"] == 3
 with server.db() as connection:
     assert [row[0] for row in connection.execute(
         "SELECT uid FROM samples ORDER BY uid")] == ["123", "126"]
+    connection.executemany(
+        "INSERT INTO replays(sid,mode,status,processed_at,player_count) "
+        "VALUES(?,'air','done',0,2)",
+        [("bbbbbbbbbbbbbbbb",), ("cccccccccccccccc",)])
+    connection.executemany(
+        "INSERT INTO samples(sid,uid,mode,squad_br,match_br,squad_countries,party_key) "
+        "VALUES(?,?,?,?,?,'[]',?)",
+        [("bbbbbbbbbbbbbbbb", "201", "air", 2.7, 2.7, "solo:201"),
+         ("cccccccccccccccc", "202", "air", 2.7, 2.7, "solo:202"),
+         ("cccccccccccccccc", "203", "air", None, 2.7, "solo:203")])
+_, _, ranges = server.party_distribution("air", None, None)
+assert ranges[27][(27, 27)] == 1  # A removed Bot does not hide the known lower bound.
+assert ranges[27][(None, 27)] == 1  # A retained player with no BR still does.
 """
             environment = os.environ.copy()
             environment.pop("PYTHONPATH", None)
