@@ -41,6 +41,7 @@ PENDING_RETRY_BATCH = 15
 MAX_PART_BYTES = 100_000_000
 MAX_IMPORT_BYTES = 300_000_000
 NO_PLAYERS = "结算段未包含玩家数据"
+NO_HUMANS = "结算段没有真人玩家"
 PLAYER_STAT_FIELDS = ("kills", "groundKills", "humanKills", "deaths", "assists", "score",
                       "aiKills", "aiGroundKills", "aiNavalKills", "captureZone", "teamKills")
 VALID_SAMPLE_SQL = ("uid <> '' AND uid NOT GLOB '*[^0-9]*' AND CAST(uid AS INTEGER)>0 "
@@ -536,6 +537,27 @@ def record_error(sid: str, item: dict, error: str, *, pending: bool = False) -> 
             runtime["last_error"] = f"{sid}: {error}"
 
 
+def record_no_humans(sid: str, item: dict, player_count: int,
+                     previous_status: str | None) -> None:
+    """Remember a Bot-only replay without adding it to battle or player statistics."""
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO replays(sid,start_utc,map,mode,group_name,last_part,status,"
+            "error,player_count,match_br,processed_at) VALUES(?,?,?,?,?,?,'skipped',?,?,NULL,?) "
+            "ON CONFLICT(sid) DO UPDATE SET status='skipped',error=excluded.error,"
+            "player_count=excluded.player_count,last_part=excluded.last_part,"
+            "processed_at=excluded.processed_at",
+            (sid, start_time(item), item.get("missionName"), "realistic",
+             GROUPS.get(item.get("statisticGroup")), item.get("partsCount"),
+             NO_HUMANS, player_count, time.time()))
+    with guard:
+        if previous_status == "error":
+            runtime["errors"] = max(0, runtime["errors"] - 1)
+        elif previous_status == "pending":
+            runtime["pending"] = max(0, runtime["pending"] - 1)
+        runtime["revision"] += 1
+
+
 def start_time(item: dict) -> str | None:
     timestamp = item.get("startTime")
     return datetime.fromtimestamp(timestamp, timezone.utc).isoformat() if isinstance(timestamp, (int, float)) else None
@@ -587,7 +609,7 @@ def process_replay(item: dict) -> None:
     with db() as connection:
         previous = connection.execute(
             "SELECT status,processed_at,error,last_part FROM replays WHERE sid=?", (sid,)).fetchone()
-    if previous and (previous["status"] == "done" or
+    if previous and (previous["status"] in ("done", "skipped") or
                      time.time() - previous["processed_at"] < (900 if previous["status"] == "pending" else 3600)):
         return
     with guard:
@@ -619,9 +641,13 @@ def process_replay(item: dict) -> None:
             raise HTTPException(502, NO_PLAYERS)
         data["game_mode"] = "realistic"
         data["battle_group"] = item["statisticGroup"]
+        real_players, match_br = rated_real_players(data)
+        if not real_players:
+            record_no_humans(sid, item, len(data["players"]),
+                             previous["status"] if previous else None)
+            return
         added_samples = 0
         with db() as connection:
-            real_players, match_br = rated_real_players(data)
             team_summary = json.dumps(team_br_summary(real_players, mode))
             teammate_countries = squad_countries(real_players)
             for player in real_players:

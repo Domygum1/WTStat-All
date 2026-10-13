@@ -38,6 +38,7 @@ import server
 import csv
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 assert replay_core.wiki_catalog()
 assert replay_core.cookie() is None
@@ -60,6 +61,24 @@ real, match_br = server.rated_real_players({
     "game_mode": "realistic", "battle_group": "aircraft",
     "players": [human, bot]})
 assert len(real) == 1 and match_br == 2.7 and real[0]["squad_br"] == 2.7
+bot_only_sid = "eeeeeeeeeeeeeeee"
+bot_only_item = {"sessionIdHex": bot_only_sid, "partsCount": 1,
+                 "gameMode": "realistic", "statisticGroup": "aircraft",
+                 "missionName": "Bot-only battle"}
+processed_before = server.runtime["processed"]
+with patch.object(server, "download_last_part", return_value=Path("ignored.wrpl")) as download, \
+     patch.object(server.wt, "parse_replay", return_value={"players": [bot]}):
+    server.process_replay(bot_only_item)
+    server.process_replay(bot_only_item)
+    assert download.call_count == 1
+with server.db() as connection:
+    assert connection.execute("SELECT status FROM replays WHERE sid=?",
+                              (bot_only_sid,)).fetchone()[0] == "skipped"
+    assert connection.execute("SELECT COUNT(*) FROM battle.matches WHERE sid=?",
+                              (bot_only_sid,)).fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM samples WHERE sid=?",
+                              (bot_only_sid,)).fetchone()[0] == 0
+assert server.runtime["processed"] == processed_before
 with sqlite3.connect(":memory:") as connection:
     connection.execute("CREATE TABLE samples (sid TEXT,uid TEXT,player_name TEXT,"
                        "country TEXT,squad_br REAL,squad_countries TEXT,party_key TEXT,"
