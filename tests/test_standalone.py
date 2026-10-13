@@ -53,6 +53,13 @@ assert server.is_real_player("123", "notrobot_1")
 assert not server.is_real_player("-12", "player")
 assert not server.is_real_player("0", "player")
 assert not server.is_real_player("123", "COOP/bot512")
+bot = {"uid": "-1", "name": "coop/Bot512", "team": 1,
+       "squad_id": 5, "auto_squad": False, "configured": []}
+human = {**player, "squad_id": 5, "auto_squad": False}
+real, match_br = server.rated_real_players({
+    "game_mode": "realistic", "battle_group": "aircraft",
+    "players": [human, bot]})
+assert len(real) == 1 and match_br == 2.7 and real[0]["squad_br"] == 2.7
 with sqlite3.connect(":memory:") as connection:
     connection.execute("CREATE TABLE samples (sid TEXT,uid TEXT,player_name TEXT,"
                        "country TEXT,squad_br REAL,squad_countries TEXT,party_key TEXT,"
@@ -111,6 +118,26 @@ with server.db() as connection:
 _, _, ranges = server.party_distribution("air", None, None)
 assert ranges[27][(27, 27)] == 1  # A removed Bot does not hide the known lower bound.
 assert ranges[27][(None, 27)] == 1  # A retained player with no BR still does.
+
+with server.db() as connection:
+    connection.execute("INSERT INTO battle.matches(sid,mode) VALUES('dddddddddddddddd','air')")
+    connection.execute("INSERT INTO replays(sid,mode,group_name,status,processed_at) "
+                       "VALUES('dddddddddddddddd','realistic','air','done',0)")
+    connection.executemany(
+        "INSERT INTO samples(sid,uid,mode,team,party_key,configured_vehicles) "
+        "VALUES('dddddddddddddddd',?,'air',?,?,?)",
+        [("301", 1, "solo:301", '[{"code":"a-20g"}]'),
+         ("302", 2, "solo:302", '[{"code":"a-20g"}]')])
+result = server.repair_missing_battle_ratings()
+assert result["repaired"] == 1 and result["unresolved"] >= 1
+with server.db() as connection:
+    battle = connection.execute("SELECT match_br_min,match_br_max,team1_br_min,"
+                                "team2_br_max FROM battle.matches "
+                                "WHERE sid='dddddddddddddddd'").fetchone()
+    assert tuple(battle) == (2.7, 2.7, 2.7, 2.7)
+    assert connection.execute("SELECT COUNT(*) FROM samples WHERE sid='dddddddddddddddd' "
+                              "AND squad_br=2.7 AND match_br=2.7").fetchone()[0] == 2
+assert server.repair_missing_battle_ratings()["repaired"] == 0
 """
             environment = os.environ.copy()
             environment.pop("PYTHONPATH", None)

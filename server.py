@@ -169,6 +169,21 @@ def is_real_player(uid: object, name: object) -> bool:
             and not (isinstance(name, str) and name.lower().startswith("coop/bot")))
 
 
+def rebuild_histogram(connection: sqlite3.Connection) -> None:
+    totals: Counter[tuple[str, str, int, int]] = Counter()
+    for row in connection.execute(
+        f"SELECT mode,country,squad_br,match_br,COUNT(*) AS n FROM samples "
+        f"WHERE {VALID_SAMPLE_SQL} GROUP BY mode,country,squad_br,match_br"
+    ):
+        squad_tick = rating_tick(row["squad_br"], row["mode"])
+        match_tick = rating_tick(row["match_br"], row["mode"])
+        if squad_tick is not None and match_tick is not None:
+            totals[(row["mode"], row["country"] or "", squad_tick, match_tick)] += row["n"]
+    connection.execute("DELETE FROM histogram")
+    connection.executemany("INSERT INTO histogram VALUES(?,?,?,?,?)",
+                           ((*key, count) for key, count in totals.items()))
+
+
 def remove_saved_bots() -> int:
     """Remove legacy bot samples and rebuild their derived histogram atomically."""
     with db() as connection:
@@ -176,15 +191,7 @@ def remove_saved_bots() -> int:
             f"SELECT COUNT(*) FROM samples WHERE NOT ({VALID_SAMPLE_SQL})").fetchone()[0]
         if excluded:
             connection.execute(f"DELETE FROM samples WHERE NOT ({VALID_SAMPLE_SQL})")
-            totals: Counter[tuple[str, str, int, int]] = Counter()
-            for row in connection.execute("SELECT mode,country,squad_br,match_br FROM samples"):
-                squad_tick = rating_tick(row["squad_br"], row["mode"])
-                match_tick = rating_tick(row["match_br"], row["mode"])
-                if squad_tick is not None and match_tick is not None:
-                    totals[(row["mode"], row["country"] or "", squad_tick, match_tick)] += 1
-            connection.execute("DELETE FROM histogram")
-            connection.executemany("INSERT INTO histogram VALUES(?,?,?,?,?)",
-                                   ((*key, count) for key, count in totals.items()))
+            rebuild_histogram(connection)
         remaining = connection.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
     runtime["samples"] = remaining
     if excluded:
@@ -230,6 +237,15 @@ def team_br_summary(players: list[dict], mode: str) -> dict[str, dict | None]:
     return result
 
 
+def rated_real_players(data: dict) -> tuple[list[dict], float | None]:
+    """Ignore system bots before resolving lineups, squads, and match BR."""
+    players = [player for player in data.get("players") or []
+               if is_real_player(player.get("uid"), player.get("name"))]
+    rated = {**data, "players": players}
+    wt.add_battle_ratings(rated)
+    return players, rated.get("match_br")
+
+
 def decoded_team_br(value: str | None) -> tuple[dict, list[float] | None]:
     try:
         teams = json.loads(value) if value else {}
@@ -273,6 +289,90 @@ def save_battle(connection: sqlite3.Connection, values: tuple, *, only_missing: 
         updates = ",".join(f"{name}=excluded.{name}" for name in BATTLE_COLUMNS[1:])
         connection.execute(f"INSERT INTO battle.matches({columns}) VALUES({placeholders}) "
                            f"ON CONFLICT(sid) DO UPDATE SET {updates}", values)
+
+
+def saved_lineup_br(configured_json: str | None, mode: str) -> float | None:
+    """Recalculate one saved human lineup from vehicle codes, not old squad BR."""
+    try:
+        vehicles = json.loads(configured_json) if configured_json else None
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(vehicles, list) or not vehicles:
+        return None
+    group = {"air": "aircraft", "ground": "tank"}.get(mode)
+    if group is None:
+        return None
+    ratings = [wt.vehicle_battle_rating(vehicle.get("code"), "realistic", group)
+               if isinstance(vehicle, dict) else None for vehicle in vehicles]
+    if any(rating_tick(br, mode) is None for br in ratings):
+        return None
+    return max(ratings)
+
+
+def repair_missing_battle_ratings() -> dict[str, int]:
+    """Backfill old Bot-poisoned battles using complete saved human lineups."""
+    repaired = unresolved = 0
+    with db() as connection:
+        battles = connection.execute(
+            "SELECT b.sid,b.mode FROM battle.matches b JOIN replays r ON r.sid=b.sid "
+            "WHERE b.match_br_max IS NULL AND r.status='done'").fetchall()
+        for battle in battles:
+            sid, mode = battle["sid"], battle["mode"]
+            rows = connection.execute(
+                f"SELECT uid,team,party_key,squad_br,configured_vehicles FROM samples "
+                f"WHERE sid=? AND {VALID_SAMPLE_SQL}", (sid,)).fetchall()
+            lineups = [saved_lineup_br(row["configured_vehicles"], mode) for row in rows]
+            if not lineups or any(br is None for br in lineups):
+                unresolved += 1
+                continue
+            match_br = max(lineups)
+            party_brs: dict[tuple[int | None, str], float] = {}
+            for row, br in zip(rows, lineups):
+                if row["party_key"]:
+                    key = (row["team"], row["party_key"])
+                    party_brs[key] = max(party_brs.get(key, br), br)
+            squad_brs = [party_brs[(row["team"], row["party_key"])]
+                         if row["party_key"] else row["squad_br"] for row in rows]
+            teams: dict[str, dict | None] = {"1": None, "2": None}
+            if all(row["team"] in (1, 2) for row in rows):
+                for team in (1, 2):
+                    members = [(row, br) for row, br in zip(rows, squad_brs)
+                               if row["team"] == team]
+                    if not members or any(rating_tick(br, mode) is None for _, br in members):
+                        continue
+                    ticks = [rating_tick(br, mode) for _, br in members]
+                    parties = {(row["team"], row["party_key"]): rating_tick(br, mode)
+                               for row, br in members if row["party_key"]}
+                    teams[str(team)] = {
+                        "min": min(ticks) / 10, "max": max(ticks) / 10,
+                        "average_squad_br": round(sum(parties.values()) / len(parties) / 10, 3)
+                        if len(parties) and all(row["party_key"] for row, _ in members) else None,
+                    }
+            sides = [teams[str(team)] for team in (1, 2)]
+            lower = (min(side["min"] for side in sides)
+                     if all(side is not None for side in sides) else None)
+            connection.execute(
+                "UPDATE battle.matches SET match_br_min=?,match_br_max=?,"
+                "team1_br_min=?,team1_br_max=?,team1_average_squad_br=?,"
+                "team2_br_min=?,team2_br_max=?,team2_average_squad_br=? WHERE sid=?",
+                (lower, match_br,
+                 *(side.get(field) if side else None for side in sides
+                   for field in ("min", "max", "average_squad_br")), sid))
+            connection.execute("UPDATE replays SET match_br=?,team_br_json=? WHERE sid=?",
+                               (match_br, json.dumps(teams), sid))
+            connection.executemany(
+                "UPDATE samples SET squad_br=?,match_br=? WHERE sid=? AND uid=?",
+                ((br, match_br, sid, row["uid"])
+                 for row, br in zip(rows, squad_brs)))
+            repaired += 1
+        if repaired:
+            rebuild_histogram(connection)
+    if repaired:
+        runtime["revision"] += 1
+    return {"repaired": repaired, "unresolved": unresolved}
+
+
+repair_missing_battle_ratings()
 
 
 def battle_api_row(row: sqlite3.Row) -> dict:
@@ -521,10 +621,7 @@ def process_replay(item: dict) -> None:
         data["battle_group"] = item["statisticGroup"]
         added_samples = 0
         with db() as connection:
-            wt.add_battle_ratings(data)
-            match_br = data.get("match_br")
-            real_players = [player for player in data["players"]
-                            if is_real_player(player.get("uid"), player.get("name"))]
+            real_players, match_br = rated_real_players(data)
             team_summary = json.dumps(team_br_summary(real_players, mode))
             teammate_countries = squad_countries(real_players)
             for player in real_players:
