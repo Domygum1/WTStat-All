@@ -41,7 +41,7 @@ PENDING_RETRY_BATCH = 15
 MAX_PART_BYTES = 100_000_000
 MAX_IMPORT_BYTES = 300_000_000
 NO_PLAYERS = "结算段未包含玩家数据"
-NO_HUMANS = "结算段没有真人玩家"
+NO_PARTICIPANTS = "结算段没有参战玩家"
 PLAYER_STAT_FIELDS = ("kills", "groundKills", "humanKills", "deaths", "assists", "score",
                       "aiKills", "aiGroundKills", "aiNavalKills", "captureZone", "teamKills")
 VALID_SAMPLE_SQL = ("uid <> '' AND uid NOT GLOB '*[^0-9]*' AND CAST(uid AS INTEGER)>0 "
@@ -204,6 +204,35 @@ init_db()
 remove_saved_bots()
 
 
+def remove_unjoined_samples() -> int:
+    """Discard legacy team-0 roster entries that have no lineup or activity."""
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT sid,uid,configured_vehicles,stats_json FROM samples WHERE team=0"
+        ).fetchall()
+        unwanted = []
+        for row in rows:
+            try:
+                configured = json.loads(row["configured_vehicles"]) if row["configured_vehicles"] else []
+                stats = json.loads(row["stats_json"]) if row["stats_json"] else {}
+            except (TypeError, ValueError):
+                continue
+            if isinstance(configured, list) and isinstance(stats, dict) and not configured \
+                    and not wt.has_activity(stats):
+                unwanted.append((row["sid"], row["uid"]))
+        if unwanted:
+            connection.executemany("DELETE FROM samples WHERE sid=? AND uid=?", unwanted)
+            rebuild_histogram(connection)
+        remaining = connection.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+    runtime["samples"] = remaining
+    if unwanted:
+        runtime["revision"] += 1
+    return len(unwanted)
+
+
+remove_unjoined_samples()
+
+
 def possible_ticks(mode: str) -> list[int]:
     limit = 147 if mode == "air" else 130
     return [tick for tick in range(10, limit + 1) if tick % 10 in (0, 3, 7)]
@@ -211,8 +240,10 @@ def possible_ticks(mode: str) -> list[int]:
 
 def team_br_summary(players: list[dict], mode: str) -> dict[str, dict | None]:
     """Summarize complete teams; count each premade squad once in the mean."""
+    players = [player for player in players if wt.has_participation_evidence(player)]
     result: dict[str, dict | None] = {"1": None, "2": None}
-    if any(player.get("team") not in (1, 2) for player in players):
+    if any(player.get("team") not in (1, 2) or
+           rating_tick(player.get("squad_br"), mode) is None for player in players):
         return result
     for team in (1, 2):
         members = [player for player in players if player.get("team") == team]
@@ -241,7 +272,8 @@ def team_br_summary(players: list[dict], mode: str) -> dict[str, dict | None]:
 def rated_real_players(data: dict) -> tuple[list[dict], float | None]:
     """Ignore system bots before resolving lineups, squads, and match BR."""
     players = [player for player in data.get("players") or []
-               if is_real_player(player.get("uid"), player.get("name"))]
+               if is_real_player(player.get("uid"), player.get("name"))
+               and not wt.is_unjoined_player(player)]
     rated = {**data, "players": players}
     wt.add_battle_ratings(rated)
     return players, rated.get("match_br")
@@ -255,9 +287,12 @@ def decoded_team_br(value: str | None) -> tuple[dict, list[float] | None]:
     if not isinstance(teams, dict):
         teams = {}
     sides = [teams.get(str(team)) for team in (1, 2)]
-    if all(isinstance(side, dict) and isinstance(side.get("min"), (int, float))
-           and isinstance(side.get("max"), (int, float)) for side in sides):
-        return teams, [min(side["min"] for side in sides), max(side["max"] for side in sides)]
+    available = [side for side in sides if isinstance(side, dict)
+                 and isinstance(side.get("min"), (int, float))
+                 and isinstance(side.get("max"), (int, float))]
+    if available:
+        return teams, [min(side["min"] for side in available),
+                       max(side["max"] for side in available)]
     return teams, None
 
 
@@ -276,7 +311,7 @@ def battle_values(sid: str, start: str | None, replay_map: str | None, mode: str
     def field(side, key):
         return side.get(key) if isinstance(side, dict) else None
     return (sid, start, replay_map, mode, player_count, last_part, processed_at,
-            interval[0] if interval else None, interval[1] if interval else match_br,
+            interval[0] if interval and match_br is not None else None, match_br,
             *(field(side, key) for side in sides
               for key in ("min", "max", "average_squad_br")))
 
@@ -310,34 +345,54 @@ def saved_lineup_br(configured_json: str | None, mode: str) -> float | None:
     return max(ratings)
 
 
+def saved_participation_evidence(row: sqlite3.Row) -> bool:
+    if row["configured_vehicles"]:
+        try:
+            if json.loads(row["configured_vehicles"]):
+                return True
+        except (TypeError, ValueError):
+            return True  # Unknown lineup must not be silently excluded from BR.
+    if row["stats_json"]:
+        try:
+            stats = json.loads(row["stats_json"])
+        except (TypeError, ValueError):
+            return True
+        return not isinstance(stats, dict) or wt.has_activity(stats)
+    return False
+
+
 def repair_missing_battle_ratings() -> dict[str, int]:
-    """Backfill old Bot-poisoned battles using complete saved human lineups."""
+    """Backfill BR from participating humans, ignoring unspawned roster entries."""
     repaired = unresolved = 0
     with db() as connection:
         battles = connection.execute(
             "SELECT b.sid,b.mode FROM battle.matches b JOIN replays r ON r.sid=b.sid "
-            "WHERE b.match_br_max IS NULL AND r.status='done'").fetchall()
+            "WHERE (b.match_br_max IS NULL OR b.match_br_min IS NULL) "
+            "AND r.status='done'").fetchall()
         for battle in battles:
             sid, mode = battle["sid"], battle["mode"]
             rows = connection.execute(
-                f"SELECT uid,team,party_key,squad_br,configured_vehicles FROM samples "
+                f"SELECT uid,team,party_key,squad_br,configured_vehicles,stats_json FROM samples "
                 f"WHERE sid=? AND {VALID_SAMPLE_SQL}", (sid,)).fetchall()
-            lineups = [saved_lineup_br(row["configured_vehicles"], mode) for row in rows]
+            rated_rows = [row for row in rows if saved_participation_evidence(row)]
+            lineups = [saved_lineup_br(row["configured_vehicles"], mode) for row in rated_rows]
             if not lineups or any(br is None for br in lineups):
                 unresolved += 1
                 continue
             match_br = max(lineups)
             party_brs: dict[tuple[int | None, str], float] = {}
-            for row, br in zip(rows, lineups):
+            for row, br in zip(rated_rows, lineups):
                 if row["party_key"]:
                     key = (row["team"], row["party_key"])
                     party_brs[key] = max(party_brs.get(key, br), br)
             squad_brs = [party_brs[(row["team"], row["party_key"])]
-                         if row["party_key"] else row["squad_br"] for row in rows]
+                         if row["party_key"] else row["squad_br"] for row in rated_rows]
+            squad_by_uid = {row["uid"]: br for row, br in zip(rated_rows, squad_brs)}
             teams: dict[str, dict | None] = {"1": None, "2": None}
-            if all(row["team"] in (1, 2) for row in rows):
+            if all(row["team"] in (1, 2) for row in rated_rows) and all(
+                    rating_tick(br, mode) is not None for br in squad_brs):
                 for team in (1, 2):
-                    members = [(row, br) for row, br in zip(rows, squad_brs)
+                    members = [(row, br) for row, br in zip(rated_rows, squad_brs)
                                if row["team"] == team]
                     if not members or any(rating_tick(br, mode) is None for _, br in members):
                         continue
@@ -350,8 +405,7 @@ def repair_missing_battle_ratings() -> dict[str, int]:
                         if len(parties) and all(row["party_key"] for row, _ in members) else None,
                     }
             sides = [teams[str(team)] for team in (1, 2)]
-            lower = (min(side["min"] for side in sides)
-                     if all(side is not None for side in sides) else None)
+            lower = min((side["min"] for side in sides if side is not None), default=None)
             connection.execute(
                 "UPDATE battle.matches SET match_br_min=?,match_br_max=?,"
                 "team1_br_min=?,team1_br_max=?,team1_average_squad_br=?,"
@@ -363,8 +417,8 @@ def repair_missing_battle_ratings() -> dict[str, int]:
                                (match_br, json.dumps(teams), sid))
             connection.executemany(
                 "UPDATE samples SET squad_br=?,match_br=? WHERE sid=? AND uid=?",
-                ((br, match_br, sid, row["uid"])
-                 for row, br in zip(rows, squad_brs)))
+                ((squad_by_uid.get(row["uid"]), match_br, sid, row["uid"])
+                 for row in rows))
             repaired += 1
         if repaired:
             rebuild_histogram(connection)
@@ -537,9 +591,9 @@ def record_error(sid: str, item: dict, error: str, *, pending: bool = False) -> 
             runtime["last_error"] = f"{sid}: {error}"
 
 
-def record_no_humans(sid: str, item: dict, player_count: int,
-                     previous_status: str | None) -> None:
-    """Remember a Bot-only replay without adding it to battle or player statistics."""
+def record_no_participants(sid: str, item: dict, player_count: int,
+                           previous_status: str | None) -> None:
+    """Remember an unplayed replay without adding it to battle or player statistics."""
     with db() as connection:
         connection.execute(
             "INSERT INTO replays(sid,start_utc,map,mode,group_name,last_part,status,"
@@ -549,7 +603,7 @@ def record_no_humans(sid: str, item: dict, player_count: int,
             "processed_at=excluded.processed_at",
             (sid, start_time(item), item.get("missionName"), "realistic",
              GROUPS.get(item.get("statisticGroup")), item.get("partsCount"),
-             NO_HUMANS, player_count, time.time()))
+             NO_PARTICIPANTS, player_count, time.time()))
     with guard:
         if previous_status == "error":
             runtime["errors"] = max(0, runtime["errors"] - 1)
@@ -642,9 +696,9 @@ def process_replay(item: dict) -> None:
         data["game_mode"] = "realistic"
         data["battle_group"] = item["statisticGroup"]
         real_players, match_br = rated_real_players(data)
-        if not real_players:
-            record_no_humans(sid, item, len(data["players"]),
-                             previous["status"] if previous else None)
+        if not any(wt.has_participation_evidence(player) for player in real_players):
+            record_no_participants(sid, item, len(data["players"]),
+                                   previous["status"] if previous else None)
             return
         added_samples = 0
         with db() as connection:
@@ -1549,6 +1603,10 @@ def import_csv_file(path: Path) -> dict:
                     vehicles = json_field(row["configured_vehicles_json"], line, "配置载具", list)
                     stats = json_field(row["stats_json"], line, "战绩", dict)
                     team = integer(row["team"], line, "team", 0, 2)
+                    if (team == 0 and not (json.loads(vehicles) if vehicles else [])
+                            and not wt.has_activity(json.loads(stats) if stats else {})):
+                        skipped_samples += 1
+                        continue
                     start = row.get("replay_start_utc") or (battle["start_utc"] if battle else None)
                     if start:
                         try:

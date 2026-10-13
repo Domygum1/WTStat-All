@@ -36,6 +36,7 @@ class StandaloneTest(unittest.TestCase):
 import replay_core
 import server
 import csv
+import json
 import sqlite3
 from pathlib import Path
 from unittest.mock import patch
@@ -61,6 +62,19 @@ real, match_br = server.rated_real_players({
     "game_mode": "realistic", "battle_group": "aircraft",
     "players": [human, bot]})
 assert len(real) == 1 and match_br == 2.7 and real[0]["squad_br"] == 2.7
+unspawned = {"uid": "2", "name": "unspawned", "team": 2, "auto_squad": True,
+             "configured": [], "score": 0}
+phantom = {"uid": "3", "name": "not joined", "team": 0, "auto_squad": False,
+           "configured": [], "score": 0}
+real, match_br = server.rated_real_players({
+    "game_mode": "realistic", "battle_group": "aircraft",
+    "players": [human, unspawned, phantom]})
+assert [item["uid"] for item in real] == ["1", "2"]
+assert match_br == 2.7 and unspawned["squad_br"] is None
+assert server.battle_values("f", None, None, "air", 2, 0, 0, match_br,
+                            json.dumps(server.team_br_summary(real, "air")))[7:9] == (2.7, 2.7)
+assert server.battle_values("f", None, None, "air", 2, 0, 0, None,
+                            json.dumps(server.team_br_summary(real, "air")))[7:9] == (None, None)
 bot_only_sid = "eeeeeeeeeeeeeeee"
 bot_only_item = {"sessionIdHex": bot_only_sid, "partsCount": 1,
                  "gameMode": "realistic", "statisticGroup": "aircraft",
@@ -79,6 +93,15 @@ with server.db() as connection:
     assert connection.execute("SELECT COUNT(*) FROM samples WHERE sid=?",
                               (bot_only_sid,)).fetchone()[0] == 0
 assert server.runtime["processed"] == processed_before
+unplayed_sid = "abababababababab"
+with patch.object(server, "download_last_part", return_value=Path("ignored.wrpl")), \
+     patch.object(server.wt, "parse_replay", return_value={"players": [unspawned]}):
+    server.process_replay({**bot_only_item, "sessionIdHex": unplayed_sid})
+with server.db() as connection:
+    assert connection.execute("SELECT status FROM replays WHERE sid=?",
+                              (unplayed_sid,)).fetchone()[0] == "skipped"
+    assert connection.execute("SELECT COUNT(*) FROM battle.matches WHERE sid=?",
+                              (unplayed_sid,)).fetchone()[0] == 0
 with sqlite3.connect(":memory:") as connection:
     connection.execute("CREATE TABLE samples (sid TEXT,uid TEXT,player_name TEXT,"
                        "country TEXT,squad_br REAL,squad_countries TEXT,party_key TEXT,"
@@ -156,6 +179,25 @@ with server.db() as connection:
     assert tuple(battle) == (2.7, 2.7, 2.7, 2.7)
     assert connection.execute("SELECT COUNT(*) FROM samples WHERE sid='dddddddddddddddd' "
                               "AND squad_br=2.7 AND match_br=2.7").fetchone()[0] == 2
+with server.db() as connection:
+    connection.execute("INSERT INTO battle.matches(sid,mode) VALUES('ffffffffffffffff','air')")
+    connection.execute("INSERT INTO replays(sid,mode,group_name,status,processed_at) "
+                       "VALUES('ffffffffffffffff','realistic','air','done',0)")
+    connection.executemany(
+        "INSERT INTO samples(sid,uid,mode,team,party_key,configured_vehicles,stats_json) "
+        "VALUES('ffffffffffffffff',?,'air',?,?,?,?)",
+        [("401", 1, "solo:401", '[{"code":"a-20g"}]', '{"score":300}'),
+         ("402", 2, "solo:402", None, '{"score":0}'),
+         ("403", 0, None, None, '{"score":0}')])
+assert server.remove_unjoined_samples() == 1
+assert server.repair_missing_battle_ratings()["repaired"] == 1
+with server.db() as connection:
+    assert [row[0] for row in connection.execute(
+        "SELECT uid FROM samples WHERE sid='ffffffffffffffff' ORDER BY uid")] == ["401", "402"]
+    assert tuple(connection.execute(
+        "SELECT match_br_min,match_br_max FROM battle.matches "
+        "WHERE sid='ffffffffffffffff'").fetchone()) == (2.7, 2.7)
+    assert connection.execute("SELECT squad_br FROM samples WHERE uid='402'").fetchone()[0] is None
 assert server.repair_missing_battle_ratings()["repaired"] == 0
 """
             environment = os.environ.copy()

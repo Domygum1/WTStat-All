@@ -172,6 +172,7 @@ def parse_replay(sid: str, files: list[Path], *, include_log=False, persist=Fals
             "aiNavalKills": item.get("aiNavalKills"), "captureZone": item.get("captureZone"),
             "teamKills": item.get("teamKills"),
         })
+    players = [player for player in players if not is_unjoined_player(player)]
     start = header.get("start_time")
     return {
         "sid": sid,
@@ -199,6 +200,22 @@ def vehicle_battle_rating(code: str, mode: str, group: str) -> float | None:
 
 VEHICLE_CATEGORY_ORDER = {"ground": 0, "aviation": 1, "helicopters": 2,
                           "boats": 3, "ships": 3}
+ACTIVITY_FIELDS = ("kills", "groundKills", "humanKills", "deaths", "assists", "score",
+                   "aiKills", "aiGroundKills", "aiNavalKills", "captureZone", "teamKills")
+
+
+def has_activity(player: dict) -> bool:
+    return any(player.get(field) not in (None, 0, 0.0) for field in ACTIVITY_FIELDS)
+
+
+def is_unjoined_player(player: dict) -> bool:
+    """A roster entry with no team, lineup, spawn, or battle activity."""
+    return (player.get("team") not in (1, 2) and not player.get("configured")
+            and not player.get("spawned") and not has_activity(player))
+
+
+def has_participation_evidence(player: dict) -> bool:
+    return bool(player.get("configured") or player.get("spawned") or has_activity(player))
 
 
 def add_battle_ratings(data: dict) -> dict:
@@ -215,17 +232,20 @@ def add_battle_ratings(data: dict) -> dict:
         ))
         ratings = [vehicle_battle_rating(item.get("code"), mode, group) for item in configured]
         player["max_br"] = max(ratings) if ratings and all(value is not None for value in ratings) else None
-    ratings = [player.get("max_br") for player in players]
+    participants = [player for player in players if has_participation_evidence(player)]
+    ratings = [player.get("max_br") for player in participants]
     data["match_br"] = (max(ratings) if ratings and all(isinstance(br, (int, float)) for br in ratings)
                         else None)
     for player in players:
         player["squad_br"] = None
         player["squad_members"] = None
+        if not has_participation_evidence(player):
+            continue
         if player.get("auto_squad") is True:
             members = [player]
         elif player.get("auto_squad") is False:
             squad_id, team = player.get("squad_id"), player.get("team")
-            members = ([other for other in players
+            members = ([other for other in participants
                         if other.get("team") == team and other.get("squad_id") == squad_id
                         and other.get("auto_squad") is False]
                        if squad_id is not None and team is not None else [player])
