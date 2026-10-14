@@ -75,6 +75,24 @@ assert server.battle_values("f", None, None, "air", 2, 0, 0, match_br,
                             json.dumps(server.team_br_summary(real, "air")))[7:9] == (2.7, 2.7)
 assert server.battle_values("f", None, None, "air", 2, 0, 0, None,
                             json.dumps(server.team_br_summary(real, "air")))[7:9] == (None, None)
+missing_player = {**human, "configured": [], "score": 717}
+resolved_player = {**missing_player, "configured": [replay_core.vehicle("ki_109")]}
+def snapshot(_sid, files, **_kwargs):
+    names = {path.name for path in files}
+    return {"players": [resolved_player if "0001.wrpl" in names else missing_player]}
+with patch.object(server, "download_last_part", side_effect=lambda _sid, n: Path(f"{n:04d}.wrpl")) as dl, \
+     patch.object(server.wt, "parse_replay", side_effect=snapshot):
+    found = server.parse_with_lineup_fallback("aaaaaaaaaaaaaaaa", 3, Path("0003.wrpl"))
+    assert found["players"][0]["configured"][0]["code"] == "ki_109"
+    assert [call.args[1] for call in dl.call_args_list] == [1]
+def late_snapshot(_sid, files, **_kwargs):
+    names = {path.name for path in files}
+    return {"players": [resolved_player if "0002.wrpl" in names else missing_player]}
+with patch.object(server, "download_last_part", side_effect=lambda _sid, n: Path(f"{n:04d}.wrpl")) as dl, \
+     patch.object(server.wt, "parse_replay", side_effect=late_snapshot):
+    found = server.parse_with_lineup_fallback("aaaaaaaaaaaaaaaa", 3, Path("0003.wrpl"))
+    assert found["players"][0]["configured"][0]["code"] == "ki_109"
+    assert [call.args[1] for call in dl.call_args_list] == [1, 0, 1, 2]
 bot_only_sid = "eeeeeeeeeeeeeeee"
 bot_only_item = {"sessionIdHex": bot_only_sid, "partsCount": 1,
                  "gameMode": "realistic", "statisticGroup": "aircraft",
@@ -199,6 +217,27 @@ with server.db() as connection:
         "WHERE sid='ffffffffffffffff'").fetchone()) == (2.7, 2.7)
     assert connection.execute("SELECT squad_br FROM samples WHERE uid='402'").fetchone()[0] is None
 assert server.repair_missing_battle_ratings()["repaired"] == 0
+legacy_sid = "1212121212121212"
+with server.db() as connection:
+    connection.execute("INSERT INTO battle.matches(sid,mode) VALUES(?,'air')", (legacy_sid,))
+    connection.execute("INSERT INTO replays(sid,mode,group_name,last_part,status,processed_at) "
+                       "VALUES(?,'realistic','air',3,'done',0)", (legacy_sid,))
+    connection.execute("INSERT INTO samples(sid,uid,player_name,mode,team,party_key,stats_json) "
+                       "VALUES(?,'4014227','RXDimA','air',1,'solo:4014227',?)",
+                       (legacy_sid, json.dumps({"score": 717})))
+with patch.object(server, "download_last_part", return_value=Path("0003.wrpl")), \
+     patch.object(server, "parse_with_lineup_fallback",
+                  return_value={"players": [{**resolved_player, "uid": "4014227",
+                                             "configured": [replay_core.vehicle("a-20g")]}]}):
+    server.repair_old_missing_lineups()
+with server.db() as connection:
+    assert connection.execute("SELECT match_br_max FROM battle.matches WHERE sid=?",
+                              (legacy_sid,)).fetchone()[0] == 2.7
+    assert json.loads(connection.execute(
+        "SELECT configured_vehicles FROM samples WHERE sid=?",
+        (legacy_sid,)).fetchone()[0])[0]["code"] == "a-20g"
+    assert connection.execute("SELECT 1 FROM lineup_repair_attempts WHERE sid=?",
+                              (legacy_sid,)).fetchone() is not None
 """
             environment = os.environ.copy()
             environment.pop("PYTHONPATH", None)

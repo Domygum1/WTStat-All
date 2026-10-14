@@ -149,7 +149,31 @@ def parse_replay(sid: str, files: list[Path], *, include_log=False, persist=Fals
         raise HTTPException(502, f"Replay 结算数据解析失败：{type(error).__name__}") from error
     result = raw.get("results") or {}
     header = raw.get("header") or {}
-    matching = result.get("matchingInfo") or {}
+    matching = dict(result.get("matchingInfo") or {})
+    missing = {str(item.get("userId")) for item in result.get("player") or []
+               if str(item.get("userId") or "").isascii()
+               and str(item.get("userId") or "").isdecimal()
+               and int(item["userId"]) > 0
+               and not str(item.get("name") or "").lower().startswith("coop/bot")
+               and has_activity(item)
+               and not (matching.get(str(item["userId"])) or {}).get("crafts_info")}
+    for earlier in reversed(files[:-1]):
+        if not missing:
+            break
+        try:
+            snapshot = json.loads(subprocess.run(
+                [str(PARSER), str(earlier)], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=40, check=True).stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        if (snapshot.get("header") or {}).get("session_id") != sid:
+            continue
+        old_matching = ((snapshot.get("results") or {}).get("matchingInfo") or {})
+        for uid in tuple(missing):
+            info = old_matching.get(uid)
+            if isinstance(info, dict) and info.get("crafts_info"):
+                matching[uid] = info
+                missing.remove(uid)
     players = []
     for item in result.get("player") or []:
         uid = str(item.get("userId") or "")

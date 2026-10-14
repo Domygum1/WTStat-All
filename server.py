@@ -111,6 +111,8 @@ def init_db() -> None:
                            "sid TEXT PRIMARY KEY, start_utc TEXT, map TEXT, mode TEXT, group_name TEXT, "
                            "last_part INTEGER, status TEXT NOT NULL, error TEXT, player_count INTEGER, "
                            "match_br REAL, processed_at REAL NOT NULL, team_br_json TEXT)")
+        connection.execute("CREATE TABLE IF NOT EXISTS lineup_repair_attempts ("
+                           "sid TEXT PRIMARY KEY, checked_at REAL NOT NULL)")
         replay_columns = {row["name"] for row in connection.execute("PRAGMA table_info(replays)")}
         if "team_br_json" not in replay_columns:
             connection.execute("ALTER TABLE replays ADD COLUMN team_br_json TEXT")
@@ -502,6 +504,40 @@ def download_last_part(sid: str, part: int) -> Path:
         response.close()
 
 
+def missing_active_lineups(players: list[dict]) -> bool:
+    return any(is_real_player(player.get("uid"), player.get("name"))
+               and wt.has_activity(player) and not player.get("configured")
+               for player in players)
+
+
+def parse_with_lineup_fallback(sid: str, last_part: int, final_path: Path) -> dict:
+    """Read the final scoreboard, then 0001, then every segment if needed."""
+    data = wt.parse_replay(sid, [final_path], include_log=False, persist=False)
+    if missing_active_lineups(data.get("players") or []) and last_part > 1:
+        try:
+            early_path = download_last_part(sid, 1)
+            data = wt.parse_replay(sid, [early_path, final_path],
+                                   include_log=False, persist=False)
+        except HTTPException as error:
+            if error.status_code == 429:
+                raise
+    if missing_active_lineups(data.get("players") or []):
+        parts = []
+        for part in range(last_part + 1):
+            if part == last_part:
+                parts.append(final_path)
+                continue
+            try:
+                parts.append(download_last_part(sid, part))
+            except HTTPException as error:
+                if error.status_code == 429:
+                    raise
+                # A missing intermediate segment does not hide later snapshots.
+        if len(parts) > 1:
+            data = wt.parse_replay(sid, parts, include_log=False, persist=False)
+    return data
+
+
 def latest_published_part(sid: str, first: int) -> int | None:
     """Probe at most eight part headers; download only the newest available candidate."""
     if not 0 <= first < wt.MAX_REPLAY_PARTS:
@@ -690,7 +726,7 @@ def process_replay(item: dict) -> None:
             path = download_last_part(sid, last_part - 1)
             last_part -= 1
             item["partsCount"] = last_part
-        data = wt.parse_replay(sid, [path], include_log=False, persist=False)
+        data = parse_with_lineup_fallback(sid, last_part, path)
         if not data.get("players"):
             raise HTTPException(502, NO_PLAYERS)
         data["game_mode"] = "realistic"
@@ -820,12 +856,71 @@ def retry_pending() -> None:
         process_page(candidates)
 
 
+def repair_old_missing_lineups() -> None:
+    """Revisit completed battles whose saved active player has no lineup."""
+    capture_mode = capture_mode_setting()
+    activity_sql = " OR ".join(
+        f"COALESCE(json_extract(s.stats_json, '$.{field}'), 0) <> 0"
+        for field in PLAYER_STAT_FIELDS)
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT DISTINCT r.sid,r.last_part FROM replays r "
+            "JOIN battle.matches b ON b.sid=r.sid "
+            "JOIN samples s ON s.sid=r.sid "
+            "LEFT JOIN lineup_repair_attempts a ON a.sid=r.sid "
+            "WHERE r.status='done' AND r.last_part IS NOT NULL "
+            "AND b.match_br_max IS NULL "
+            "AND (?='all' OR r.group_name=?) "
+            "AND a.sid IS NULL AND (s.configured_vehicles IS NULL "
+            f"OR s.configured_vehicles='[]') AND ({activity_sql}) "
+            "ORDER BY r.processed_at LIMIT 2",
+            (capture_mode, capture_mode)).fetchall()
+    changed = False
+    for row in rows:
+        if stop_event.is_set():
+            break
+        sid, last_part = row["sid"], row["last_part"]
+        try:
+            final_path = download_last_part(sid, last_part)
+            data = parse_with_lineup_fallback(sid, last_part, final_path)
+            recovered = {str(player["uid"]): player for player in data.get("players") or []
+                         if is_real_player(player.get("uid"), player.get("name"))
+                         and wt.has_activity(player) and player.get("configured")}
+            with db() as connection:
+                for uid, player in recovered.items():
+                    cursor = connection.execute(
+                        "UPDATE samples SET configured_vehicles=?,country=? "
+                        "WHERE sid=? AND uid=? AND (configured_vehicles IS NULL "
+                        "OR configured_vehicles='[]')",
+                        (json.dumps(player["configured"], ensure_ascii=False),
+                         player_country(player), sid, uid))
+                    changed = bool(cursor.rowcount) or changed
+                connection.execute(
+                    "INSERT OR REPLACE INTO lineup_repair_attempts VALUES(?,?)",
+                    (sid, time.time()))
+        except HTTPException as error:
+            if error.status_code == 429:
+                with guard:
+                    runtime["last_error"] = "Gaijin 返回 429，采集已停止；请稍后再开启。"
+                stop_event.set()
+                break
+            with db() as connection:
+                connection.execute(
+                    "INSERT OR REPLACE INTO lineup_repair_attempts VALUES(?,?)",
+                    (sid, time.time()))
+    if changed:
+        repair_missing_battle_ratings()
+
+
 def scan_loop() -> None:
     try:
         pages_since_head = 20 if setting("page", 1) > 1 else 0
         while not stop_event.is_set():
             # Give settled replays a bounded, concurrent retry batch before new pages.
             retry_pending()
+            if stop_event.is_set():
+                break
+            repair_old_missing_lineups()
             if stop_event.is_set():
                 break
             page = setting("page", 1)
