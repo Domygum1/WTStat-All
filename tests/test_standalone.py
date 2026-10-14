@@ -51,6 +51,23 @@ assert data["match_br"] == player["squad_br"] == 2.7
 assert server.index().path.is_file()
 assert server.wt_symbols_font().path.is_file()
 assert server.status()["cookie_configured"] is False
+server.update_settings(server.Settings(concurrency=2, keep_files=100,
+                                       capture_mode="air"))
+assert server.coverage_data()["modes"] == ["air"]
+server.update_settings(server.Settings(concurrency=2, keep_files=100,
+                                       capture_mode="all"))
+class EmptyListing:
+    status_code = 200
+    headers = {"Content-Type": "application/json"}
+    def json(self): return {"items": [], "total_count": 0}
+    def close(self): pass
+with patch.object(server.wt, "request", return_value=EmptyListing()):
+    try:
+        server.fetch_page(1)
+    except server.HTTPException as error:
+        assert error.status_code == 401
+    else:
+        raise AssertionError("An expired login must not count as zero battles")
 assert server.is_real_player("123", "notrobot_1")
 assert not server.is_real_player("-12", "player")
 assert not server.is_real_player("0", "player")
@@ -238,6 +255,54 @@ with server.db() as connection:
         (legacy_sid,)).fetchone()[0])[0]["code"] == "a-20g"
     assert connection.execute("SELECT 1 FROM lineup_repair_attempts WHERE sid=?",
                               (legacy_sid,)).fetchone() is not None
+lower_only_sid = "3434343434343434"
+with server.db() as connection:
+    connection.execute("INSERT INTO battle.matches(sid,mode,match_br_max) "
+                       "VALUES(?,'air',2.7)", (lower_only_sid,))
+    connection.execute("INSERT INTO replays(sid,mode,group_name,last_part,status,processed_at) "
+                       "VALUES(?,'realistic','air',3,'done',0)", (lower_only_sid,))
+    connection.execute("INSERT INTO samples(sid,uid,player_name,mode,team,stats_json) "
+                       "VALUES(?,'4014227','RXDimA','air',1,?)",
+                       (lower_only_sid, json.dumps({"score": 717})))
+with patch.object(server, "download_last_part", return_value=Path("0003.wrpl")), \
+     patch.object(server, "parse_with_lineup_fallback",
+                  return_value={"players": [{**resolved_player, "uid": "4014227",
+                                             "configured": [replay_core.vehicle("a-20g")]}]}):
+    server.repair_old_missing_lineups()
+with server.db() as connection:
+    assert tuple(connection.execute(
+        "SELECT match_br_min,match_br_max FROM battle.matches WHERE sid=?",
+        (lower_only_sid,)).fetchone()) == (2.7, 2.7)
+official_items = [
+    {"sessionIdHex": "1010101010101010", "startTime": 1791840000,
+     "gameMode": "realistic", "gameType": "randomBattle",
+     "statisticGroup": "aircraft", "isCompleted": True},
+    {"sessionIdHex": "2020202020202020", "startTime": 1791840001,
+     "gameMode": "realistic", "gameType": "randomBattle",
+     "statisticGroup": "tank", "isCompleted": True},
+    {"sessionIdHex": "3030303030303030", "startTime": 1791840002,
+     "gameMode": "arcade", "gameType": "randomBattle",
+     "statisticGroup": "aircraft", "isCompleted": True}]
+with patch.object(server, "process_replay"):
+    server.process_page(official_items)
+    server.process_page(official_items)
+with server.db() as connection:
+    connection.execute("INSERT INTO replays(sid,group_name,status,processed_at) "
+                       "VALUES('1010101010101010','air','done',0)")
+    connection.execute("INSERT INTO samples(sid,uid,mode) "
+                       "VALUES('1010101010101010','77','air')")
+server.save_setting("official_index_complete", 1)
+server.save_setting("capture_mode", "air")
+server.save_setting("capture_modes_seen", "air")
+coverage = server.coverage_data()
+assert coverage["official"] == coverage["collected"] == 1
+assert coverage["ratio"] == 1 and coverage["modes"] == ["air"]
+server.update_settings(server.Settings(concurrency=2, keep_files=100,
+                                       capture_mode="ground"))
+coverage = server.coverage_data()
+assert coverage["modes"] == ["air", "ground"]
+assert coverage["official"] == 2 and coverage["collected"] == 1
+assert coverage["ratio"] == 0.5 and coverage["complete"]
 """
             environment = os.environ.copy()
             environment.pop("PYTHONPATH", None)

@@ -112,7 +112,21 @@ def init_db() -> None:
                            "last_part INTEGER, status TEXT NOT NULL, error TEXT, player_count INTEGER, "
                            "match_br REAL, processed_at REAL NOT NULL, team_br_json TEXT)")
         connection.execute("CREATE TABLE IF NOT EXISTS lineup_repair_attempts ("
-                           "sid TEXT PRIMARY KEY, checked_at REAL NOT NULL)")
+                           "sid TEXT PRIMARY KEY, checked_at REAL NOT NULL, "
+                           "retryable INTEGER NOT NULL DEFAULT 0)")
+        attempt_columns = {row["name"] for row in connection.execute(
+            "PRAGMA table_info(lineup_repair_attempts)")}
+        if "retryable" not in attempt_columns:
+            connection.execute("ALTER TABLE lineup_repair_attempts "
+                               "ADD COLUMN retryable INTEGER NOT NULL DEFAULT 0")
+        if not connection.execute(
+                "SELECT 1 FROM settings WHERE key='team_interval_repair_v2'").fetchone():
+            connection.execute("DELETE FROM lineup_repair_attempts")
+            connection.execute("INSERT INTO settings VALUES('team_interval_repair_v2','1')")
+        connection.execute("CREATE TABLE IF NOT EXISTS official_replays ("
+                           "sid TEXT PRIMARY KEY, start_utc TEXT, group_name TEXT NOT NULL)")
+        connection.execute("CREATE INDEX IF NOT EXISTS official_replays_group "
+                           "ON official_replays(group_name)")
         replay_columns = {row["name"] for row in connection.execute("PRAGMA table_info(replays)")}
         if "team_br_json" not in replay_columns:
             connection.execute("ALTER TABLE replays ADD COLUMN team_br_json TEXT")
@@ -141,6 +155,20 @@ def init_db() -> None:
         for key, value in (("page", 1), ("concurrency", 2), ("keep_files", 100),
                            ("capture_mode", "all")):
             connection.execute("INSERT OR IGNORE INTO settings VALUES(?,?)", (key, str(value)))
+        if not connection.execute(
+                "SELECT 1 FROM settings WHERE key='official_index_initialized'").fetchone():
+            # Earlier versions did not retain list-only results. Revisit page one
+            # once to index both modes; completed replays will not be downloaded again.
+            connection.execute("UPDATE settings SET value='1' WHERE key='page'")
+            connection.execute("INSERT INTO settings VALUES('official_index_initialized','1')")
+            connection.execute("INSERT OR REPLACE INTO settings VALUES('official_index_complete','0')")
+        if not connection.execute(
+                "SELECT 1 FROM settings WHERE key='capture_modes_seen'").fetchone():
+            modes = {row[0] for row in connection.execute(
+                "SELECT DISTINCT group_name FROM replays WHERE status='done' "
+                "AND group_name IN ('air','ground')")}
+            connection.execute("INSERT INTO settings VALUES('capture_modes_seen',?)",
+                               (",".join(sorted(modes)),))
         if not connection.execute("SELECT 1 FROM settings WHERE key='keep_files_default_100'").fetchone():
             connection.execute("UPDATE settings SET value='100' WHERE key='keep_files' AND value='10'")
             connection.execute("INSERT INTO settings VALUES('keep_files_default_100','1')")
@@ -462,6 +490,8 @@ def fetch_page(page: int) -> dict:
         result = response.json()
         if not isinstance(result.get("items"), list) or not isinstance(result.get("total_count"), int):
             raise HTTPException(502, "官网对局列表格式已变化。")
+        if result["total_count"] == 0:
+            raise HTTPException(401, "官网回放列表为空；identity_sid 可能已过期，请重新登录。")
         return result
     finally:
         response.close()
@@ -513,6 +543,7 @@ def missing_active_lineups(players: list[dict]) -> bool:
 def parse_with_lineup_fallback(sid: str, last_part: int, final_path: Path) -> dict:
     """Read the final scoreboard, then 0001, then every segment if needed."""
     data = wt.parse_replay(sid, [final_path], include_log=False, persist=False)
+    incomplete = False
     if missing_active_lineups(data.get("players") or []) and last_part > 1:
         try:
             early_path = download_last_part(sid, 1)
@@ -521,6 +552,7 @@ def parse_with_lineup_fallback(sid: str, last_part: int, final_path: Path) -> di
         except HTTPException as error:
             if error.status_code == 429:
                 raise
+            incomplete = True
     if missing_active_lineups(data.get("players") or []):
         parts = []
         for part in range(last_part + 1):
@@ -532,9 +564,11 @@ def parse_with_lineup_fallback(sid: str, last_part: int, final_path: Path) -> di
             except HTTPException as error:
                 if error.status_code == 429:
                     raise
+                incomplete = True
                 # A missing intermediate segment does not hide later snapshots.
         if len(parts) > 1:
             data = wt.parse_replay(sid, parts, include_log=False, persist=False)
+    data["_lineup_download_incomplete"] = incomplete
     return data
 
 
@@ -808,6 +842,22 @@ def process_replay(item: dict) -> None:
 
 
 def process_page(items: list[dict]) -> None:
+    official_rows = []
+    for item in items:
+        sid = str(item.get("sessionIdHex") or "").lower()
+        if (len(sid) != 16 or any(char not in "0123456789abcdef" for char in sid)
+                or item.get("gameMode") != "realistic"
+                or item.get("gameType") not in (None, "randomBattle")
+                or item.get("isCompleted") is False
+                or item.get("statisticGroup") not in GROUPS):
+            continue
+        official_rows.append((sid, start_time(item), GROUPS[item["statisticGroup"]]))
+    if official_rows:
+        with db() as connection:
+            connection.executemany(
+                "INSERT INTO official_replays(sid,start_utc,group_name) VALUES(?,?,?) "
+                "ON CONFLICT(sid) DO UPDATE SET start_utc=excluded.start_utc,"
+                "group_name=excluded.group_name", official_rows)
     capture_mode = capture_mode_setting()
     candidates = [item for item in items if item.get("statisticGroup") in GROUPS
                   and (capture_mode == "all" or GROUPS[item["statisticGroup"]] == capture_mode)
@@ -857,24 +907,19 @@ def retry_pending() -> None:
 
 
 def repair_old_missing_lineups() -> None:
-    """Revisit completed battles whose saved active player has no lineup."""
-    capture_mode = capture_mode_setting()
-    activity_sql = " OR ".join(
-        f"COALESCE(json_extract(s.stats_json, '$.{field}'), 0) <> 0"
-        for field in PLAYER_STAT_FIELDS)
+    """Reparse incomplete saved battles and refresh their team BR intervals."""
     with db() as connection:
         rows = connection.execute(
-            "SELECT DISTINCT r.sid,r.last_part FROM replays r "
+            "SELECT r.sid,r.last_part,r.group_name,r.start_utc,r.map,"
+            "r.player_count,r.processed_at FROM replays r "
             "JOIN battle.matches b ON b.sid=r.sid "
-            "JOIN samples s ON s.sid=r.sid "
             "LEFT JOIN lineup_repair_attempts a ON a.sid=r.sid "
             "WHERE r.status='done' AND r.last_part IS NOT NULL "
-            "AND b.match_br_max IS NULL "
-            "AND (?='all' OR r.group_name=?) "
-            "AND a.sid IS NULL AND (s.configured_vehicles IS NULL "
-            f"OR s.configured_vehicles='[]') AND ({activity_sql}) "
-            "ORDER BY r.processed_at LIMIT 2",
-            (capture_mode, capture_mode)).fetchall()
+            "AND r.group_name IN ('air','ground') "
+            "AND (b.match_br_min IS NULL OR b.match_br_max IS NULL) "
+            "AND (a.sid IS NULL OR (a.retryable=1 AND a.checked_at<?)) "
+            "ORDER BY r.processed_at DESC LIMIT 2",
+            (time.time() - 3600,)).fetchall()
     changed = False
     for row in rows:
         if stop_event.is_set():
@@ -883,21 +928,46 @@ def repair_old_missing_lineups() -> None:
         try:
             final_path = download_last_part(sid, last_part)
             data = parse_with_lineup_fallback(sid, last_part, final_path)
-            recovered = {str(player["uid"]): player for player in data.get("players") or []
-                         if is_real_player(player.get("uid"), player.get("name"))
-                         and wt.has_activity(player) and player.get("configured")}
+            data["game_mode"] = "realistic"
+            data["battle_group"] = "aircraft" if row["group_name"] == "air" else "tank"
+            players, match_br = rated_real_players(data)
+            summary = json.dumps(team_br_summary(players, row["group_name"]))
+            values = battle_values(
+                sid, row["start_utc"], row["map"], row["group_name"],
+                row["player_count"], last_part, row["processed_at"],
+                match_br, summary)
+            if values[7] is None or match_br is None:
+                # The saved result still lacks enough data for a reliable lower bound.
+                with db() as connection:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO lineup_repair_attempts "
+                        "(sid,checked_at,retryable) VALUES(?,?,?)",
+                        (sid, time.time(), int(data.get("_lineup_download_incomplete", False))))
+                continue
+            teammate_countries = squad_countries(players)
             with db() as connection:
-                for uid, player in recovered.items():
-                    cursor = connection.execute(
-                        "UPDATE samples SET configured_vehicles=?,country=? "
-                        "WHERE sid=? AND uid=? AND (configured_vehicles IS NULL "
-                        "OR configured_vehicles='[]')",
-                        (json.dumps(player["configured"], ensure_ascii=False),
-                         player_country(player), sid, uid))
-                    changed = bool(cursor.rowcount) or changed
+                connection.execute("DELETE FROM samples WHERE sid=?", (sid,))
+                for player in players:
+                    uid = str(player["uid"])
+                    connection.execute(
+                        "INSERT INTO samples(sid,uid,player_name,country,squad_br,"
+                        "match_br,mode,squad_countries,party_key,configured_vehicles,"
+                        "stats_json,team) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (sid, uid, player.get("name"), player_country(player),
+                         player.get("squad_br"), match_br, row["group_name"],
+                         teammate_countries[uid], party_key(player),
+                         json.dumps(player.get("configured"), ensure_ascii=False)
+                         if player.get("configured") else None,
+                         json.dumps({key: player.get(key) for key in PLAYER_STAT_FIELDS},
+                                    ensure_ascii=False), player.get("team")))
+                save_battle(connection, values)
+                connection.execute("UPDATE replays SET match_br=?,team_br_json=? "
+                                   "WHERE sid=?", (match_br, summary, sid))
                 connection.execute(
-                    "INSERT OR REPLACE INTO lineup_repair_attempts VALUES(?,?)",
+                    "INSERT OR REPLACE INTO lineup_repair_attempts "
+                    "(sid,checked_at,retryable) VALUES(?,?,0)",
                     (sid, time.time()))
+            changed = True
         except HTTPException as error:
             if error.status_code == 429:
                 with guard:
@@ -906,10 +976,15 @@ def repair_old_missing_lineups() -> None:
                 break
             with db() as connection:
                 connection.execute(
-                    "INSERT OR REPLACE INTO lineup_repair_attempts VALUES(?,?)",
+                    "INSERT OR REPLACE INTO lineup_repair_attempts "
+                    "(sid,checked_at,retryable) VALUES(?,?,1)",
                     (sid, time.time()))
     if changed:
-        repair_missing_battle_ratings()
+        with db() as connection:
+            rebuild_histogram(connection)
+            runtime["samples"] = connection.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+        with guard:
+            runtime["revision"] += 1
 
 
 def scan_loop() -> None:
@@ -936,6 +1011,7 @@ def scan_loop() -> None:
                 runtime["official_total"] = listing["total_count"]
                 runtime["scanned_pages"] += 1
             if not listing["items"]:
+                save_setting("official_index_complete", 1)
                 save_setting("page", 1)
                 stop_event.wait(30)
                 continue
@@ -965,7 +1041,48 @@ def status_data() -> dict:
     snapshot["capture_mode"] = capture_mode_setting()
     snapshot["saved_files"] = sum(1 for _ in CACHE.glob("*/*.wrpl"))
     snapshot["cookie_configured"] = bool(wt.cookie())
+    snapshot["coverage"] = coverage_data()
     return snapshot
+
+
+def coverage_data() -> dict:
+    with db() as connection:
+        saved = connection.execute(
+            "SELECT value FROM settings WHERE key='capture_modes_seen'").fetchone()
+        modes = {mode for mode in (saved["value"].split(",") if saved else [])
+                 if mode in ("air", "ground")}
+        current = connection.execute(
+            "SELECT value FROM settings WHERE key='capture_mode'").fetchone()
+        current_mode = current["value"] if current else "all"
+        modes.update(("air", "ground") if current_mode == "all" else (current_mode,))
+        modes.update(row[0] for row in connection.execute(
+            "SELECT DISTINCT group_name FROM replays WHERE status='done' "
+            "AND group_name IN ('air','ground')"))
+        rows = connection.execute(
+            "SELECT o.group_name,COUNT(*) AS official_count,"
+            "SUM(CASE WHEN r.status='done' AND EXISTS ("
+            "SELECT 1 FROM samples s WHERE s.sid=o.sid) THEN 1 ELSE 0 END) "
+            "AS collected_count FROM official_replays o "
+            "LEFT JOIN replays r ON r.sid=o.sid GROUP BY o.group_name").fetchall()
+        span = connection.execute(
+            "SELECT MIN(start_utc) AS earliest_utc,MAX(start_utc) AS latest_utc "
+            "FROM official_replays").fetchone()
+        complete = connection.execute(
+            "SELECT value FROM settings WHERE key='official_index_complete'").fetchone()
+    counts = {mode: {"official": 0, "collected": 0} for mode in ("air", "ground")}
+    for row in rows:
+        if row["group_name"] in counts:
+            counts[row["group_name"]] = {
+                "official": row["official_count"],
+                "collected": row["collected_count"] or 0}
+    official = sum(counts[mode]["official"] for mode in modes)
+    collected = sum(counts[mode]["collected"] for mode in modes)
+    is_complete = bool(complete and complete["value"] == "1")
+    return {"modes": sorted(modes), "by_mode": counts, "official": official,
+            "collected": collected,
+            "ratio": collected / official if is_complete and official else None,
+            "complete": is_complete,
+            "earliest_utc": span["earliest_utc"], "latest_utc": span["latest_utc"]}
 
 
 class Control(BaseModel):
@@ -1010,6 +1127,16 @@ def control(payload: Control):
                     raise HTTPException(409, "正在停止当前任务，请稍后重新启动。")
             else:
                 stop_event.clear()
+                with db() as connection:
+                    row = connection.execute(
+                        "SELECT value FROM settings WHERE key='capture_modes_seen'").fetchone()
+                    modes = set(row["value"].split(",")) if row else set()
+                    current = connection.execute(
+                        "SELECT value FROM settings WHERE key='capture_mode'").fetchone()["value"]
+                    modes.update(("air", "ground") if current == "all" else (current,))
+                    connection.execute(
+                        "INSERT OR REPLACE INTO settings VALUES('capture_modes_seen',?)",
+                        (",".join(sorted(modes & {"air", "ground"})),))
                 runtime["running"] = True
                 runtime["stopping"] = False
                 runtime["last_error"] = None
@@ -1113,10 +1240,15 @@ def clear_data():
         with db() as connection:
             deleted_replays = connection.execute("SELECT COUNT(*) FROM replays").fetchone()[0]
             deleted_samples = connection.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
-            for table in ("histogram", "samples", "replays"):
+            for table in ("histogram", "samples", "replays", "official_replays",
+                          "lineup_repair_attempts"):
                 connection.execute(f"DELETE FROM {table}")
             connection.execute("DELETE FROM battle.matches")
             connection.execute("UPDATE settings SET value='1' WHERE key='page'")
+            connection.execute("INSERT OR REPLACE INTO settings "
+                               "VALUES('official_index_complete','0')")
+            connection.execute("INSERT OR REPLACE INTO settings "
+                               "VALUES('capture_modes_seen','')")
         runtime.update(page=1, official_total=None, processed=0, errors=0, pending=0, samples=0,
                        last_error=None, active=0, scanned_pages=0)
         runtime["revision"] += 1
