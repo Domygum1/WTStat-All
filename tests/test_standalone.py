@@ -88,10 +88,25 @@ real, match_br = server.rated_real_players({
     "players": [human, unspawned, phantom]})
 assert [item["uid"] for item in real] == ["1", "2"]
 assert match_br == 2.7 and unspawned["squad_br"] is None
+one_human_team = server.team_br_summary(real, "air", match_br)
+assert one_human_team["1"]["min"] == 2.7
+assert one_human_team["2"] == {"min": 2.7, "max": 2.7,
+                                "average_squad_br": 2.7}
+red_only = server.team_br_summary([{**real[0], "team": 2}], "air", match_br)
+assert red_only["1"] == {"min": 2.7, "max": 2.7,
+                          "average_squad_br": 2.7}
 assert server.battle_values("f", None, None, "air", 2, 0, 0, match_br,
-                            json.dumps(server.team_br_summary(real, "air")))[7:9] == (2.7, 2.7)
+                            json.dumps(one_human_team))[7:] == (
+                                2.7, 2.7, 2.7, 2.7, 2.7, 2.7, 2.7, 2.7)
 assert server.battle_values("f", None, None, "air", 2, 0, 0, None,
                             json.dumps(server.team_br_summary(real, "air")))[7:9] == (None, None)
+assert server.team_br_summary([], "air", 2.7) == {"1": None, "2": None}
+other_human = {**human, "uid": "4", "team": 2, "squad_id": None,
+               "auto_squad": True}
+both, both_br = server.rated_real_players({
+    "game_mode": "realistic", "battle_group": "aircraft",
+    "players": [human, other_human]})
+assert server.team_br_summary(both, "air", both_br)["2"]["min"] == 2.7
 missing_player = {**human, "configured": [], "score": 717}
 resolved_player = {**missing_player, "configured": [replay_core.vehicle("ki_109")]}
 def snapshot(_sid, files, **_kwargs):
@@ -214,6 +229,33 @@ with server.db() as connection:
     assert tuple(battle) == (2.7, 2.7, 2.7, 2.7)
     assert connection.execute("SELECT COUNT(*) FROM samples WHERE sid='dddddddddddddddd' "
                               "AND squad_br=2.7 AND match_br=2.7").fetchone()[0] == 2
+legacy_bot_sid = "5656565656565656"
+legacy_human_sid = "6767676767676767"
+with server.db() as connection:
+    for sid in (legacy_bot_sid, legacy_human_sid):
+        connection.execute(
+            "INSERT INTO battle.matches(sid,mode,match_br_min,match_br_max,"
+            "team2_br_min,team2_br_max,team2_average_squad_br) "
+            "VALUES(?,'air',2.7,2.7,2.7,2.7,2.7)", (sid,))
+        connection.execute(
+            "INSERT INTO samples(sid,uid,player_name,mode,team) "
+            "VALUES(?,?,'human','air',2)", (sid, sid[:8]))
+    connection.execute(
+        "INSERT INTO samples(sid,uid,player_name,mode,team) "
+        "VALUES(?,'987654321','human','air',1)", (legacy_human_sid,))
+assert server.fill_saved_bot_team_brs() == 1
+with server.db() as connection:
+    assert tuple(connection.execute(
+        "SELECT team1_br_min,team1_br_max,team1_average_squad_br "
+        "FROM battle.matches WHERE sid=?", (legacy_bot_sid,)).fetchone()) == (2.7, 2.7, 2.7)
+    assert connection.execute(
+        "SELECT team1_br_min FROM battle.matches WHERE sid=?",
+        (legacy_human_sid,)).fetchone()[0] is None
+    rows = list(server.battle_csv_rows(connection))
+    assert rows[0][-1] == "match_br_range"
+    assert "team1_br_range" not in rows[0] and "team2_br_range" not in rows[0]
+    assert len(rows[0]) == len(rows[-1])
+    assert next(row[-1] for row in rows[1:] if row[0] == legacy_bot_sid) == "[2.7,2.7]"
 with server.db() as connection:
     connection.execute("INSERT INTO battle.matches(sid,mode) VALUES('ffffffffffffffff','air')")
     connection.execute("INSERT INTO replays(sid,mode,group_name,status,processed_at) "

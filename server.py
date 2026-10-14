@@ -275,8 +275,23 @@ def possible_ticks(mode: str) -> list[int]:
     return [tick for tick in range(10, limit + 1) if tick % 10 in (0, 3, 7)]
 
 
-def team_br_summary(players: list[dict], mode: str) -> dict[str, dict | None]:
-    """Summarize complete teams; count each premade squad once in the mean."""
+def fill_bot_team_br(teams: dict[str, dict | None], occupied_teams: set[int],
+                     match_br: float | None, mode: str) -> None:
+    """Use the match BR as a proxy when the opposing team has no participating humans."""
+    if rating_tick(match_br, mode) is None:
+        return
+    known = [team for team in (1, 2) if teams[str(team)] is not None]
+    if len(known) != 1:
+        return
+    missing = 3 - known[0]
+    if missing not in occupied_teams:
+        teams[str(missing)] = {"min": match_br, "max": match_br,
+                               "average_squad_br": match_br}
+
+
+def team_br_summary(players: list[dict], mode: str,
+                    match_br: float | None = None) -> dict[str, dict | None]:
+    """Summarize human teams and infer a bot-only team's BR from the match."""
     players = [player for player in players if wt.has_participation_evidence(player)]
     result: dict[str, dict | None] = {"1": None, "2": None}
     if any(player.get("team") not in (1, 2) or
@@ -303,6 +318,7 @@ def team_br_summary(players: list[dict], mode: str) -> dict[str, dict | None]:
             "average_squad_br": round(sum(parties.values()) / len(parties) / 10, 3)
             if complete_parties and parties else None,
         }
+    fill_bot_team_br(result, {player.get("team") for player in players}, match_br, mode)
     return result
 
 
@@ -441,6 +457,7 @@ def repair_missing_battle_ratings() -> dict[str, int]:
                         "average_squad_br": round(sum(parties.values()) / len(parties) / 10, 3)
                         if len(parties) and all(row["party_key"] for row, _ in members) else None,
                     }
+            fill_bot_team_br(teams, {row["team"] for row in rated_rows}, match_br, mode)
             sides = [teams[str(team)] for team in (1, 2)]
             lower = min((side["min"] for side in sides if side is not None), default=None)
             connection.execute(
@@ -465,6 +482,42 @@ def repair_missing_battle_ratings() -> dict[str, int]:
 
 
 repair_missing_battle_ratings()
+
+
+def fill_saved_bot_team_brs() -> int:
+    """Fill old bot-only sides when saved human samples confirm the empty team."""
+    filled = 0
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT sid,mode,match_br_max,team1_br_min,team1_br_max,"
+            "team2_br_min,team2_br_max FROM battle.matches "
+            "WHERE match_br_max IS NOT NULL AND "
+            "((team1_br_min IS NULL AND team1_br_max IS NULL "
+            "AND team2_br_min IS NOT NULL AND team2_br_max IS NOT NULL) OR "
+            "(team2_br_min IS NULL AND team2_br_max IS NULL "
+            "AND team1_br_min IS NOT NULL AND team1_br_max IS NOT NULL))"
+        ).fetchall()
+        for row in rows:
+            if rating_tick(row["match_br_max"], row["mode"]) is None:
+                continue
+            occupied = {sample[0] for sample in connection.execute(
+                f"SELECT DISTINCT team FROM samples WHERE sid=? AND {VALID_SAMPLE_SQL} "
+                "AND team IN (1,2)", (row["sid"],))}
+            missing = 1 if row["team1_br_min"] is None else 2
+            if occupied != {3 - missing}:
+                continue
+            prefix = f"team{missing}"
+            connection.execute(
+                f"UPDATE battle.matches SET {prefix}_br_min=?,{prefix}_br_max=?,"
+                f"{prefix}_average_squad_br=? WHERE sid=?",
+                (row["match_br_max"],) * 3 + (row["sid"],))
+            filled += 1
+    if filled:
+        runtime["revision"] += 1
+    return filled
+
+
+fill_saved_bot_team_brs()
 
 
 def battle_api_row(row: sqlite3.Row) -> dict:
@@ -779,7 +832,7 @@ def process_replay(item: dict) -> None:
             return
         added_samples = 0
         with db() as connection:
-            team_summary = json.dumps(team_br_summary(real_players, mode))
+            team_summary = json.dumps(team_br_summary(real_players, mode, match_br))
             teammate_countries = squad_countries(real_players)
             for player in real_players:
                 country = player_country(player)
@@ -938,7 +991,7 @@ def repair_old_missing_lineups() -> None:
             data["game_mode"] = "realistic"
             data["battle_group"] = "aircraft" if row["group_name"] == "air" else "tank"
             players, match_br = rated_real_players(data)
-            summary = json.dumps(team_br_summary(players, row["group_name"]))
+            summary = json.dumps(team_br_summary(players, row["group_name"], match_br))
             values = battle_values(
                 sid, row["start_utc"], row["map"], row["group_name"],
                 row["player_count"], last_part, row["processed_at"],
@@ -1681,14 +1734,13 @@ def player_csv_rows(connection: sqlite3.Connection):
 
 
 def battle_csv_rows(connection: sqlite3.Connection):
-    yield (*BATTLE_COLUMNS, "match_br_range", "team1_br_range", "team2_br_range")
+    yield (*BATTLE_COLUMNS, "match_br_range")
     for row in connection.execute(
         f"SELECT {','.join(BATTLE_COLUMNS)} FROM battle.matches ORDER BY sid"):
         data = dict(row)
-        def interval(prefix):
-            low, high = data[f"{prefix}_br_min"], data[f"{prefix}_br_max"]
-            return f"[{low:.1f},{high:.1f}]" if low is not None and high is not None else ""
-        yield (*row, interval("match"), interval("team1"), interval("team2"))
+        low, high = data["match_br_min"], data["match_br_max"]
+        match_range = f"[{low:.1f},{high:.1f}]" if low is not None and high is not None else ""
+        yield (*row, match_range)
 
 
 def csv_chunks(rows):
