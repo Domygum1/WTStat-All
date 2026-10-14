@@ -231,20 +231,32 @@ with server.db() as connection:
     assert connection.execute("SELECT COUNT(*) FROM samples WHERE sid='dddddddddddddddd' "
                               "AND squad_br=2.7 AND match_br=2.7").fetchone()[0] == 2
 legacy_bot_sid = "5656565656565656"
-legacy_human_sid = "6767676767676767"
+legacy_unjoined_sid = "6767676767676767"
+legacy_human_sid = "7878787878787878"
 with server.db() as connection:
-    for sid in (legacy_bot_sid, legacy_human_sid):
+    for sid in (legacy_bot_sid, legacy_unjoined_sid, legacy_human_sid):
         connection.execute(
             "INSERT INTO battle.matches(sid,mode,match_br_min,match_br_max,"
             "team2_br_min,team2_br_max,team2_average_squad_br) "
             "VALUES(?,'air',2.7,2.7,2.7,2.7,2.7)", (sid,))
         connection.execute(
-            "INSERT INTO samples(sid,uid,player_name,mode,team) "
-            "VALUES(?,?,'human','air',2)", (sid, sid[:8]))
+            "INSERT INTO samples(sid,uid,player_name,mode,team,stats_json) "
+            "VALUES(?,?,'human','air',2,?)",
+            (sid, sid[:8], json.dumps({"score": 100})))
     connection.execute(
-        "INSERT INTO samples(sid,uid,player_name,mode,team) "
-        "VALUES(?,'987654321','human','air',1)", (legacy_human_sid,))
-assert server.fill_saved_bot_team_brs() == 1
+        "INSERT INTO samples(sid,uid,player_name,mode,team,stats_json) "
+        "VALUES(?,'987654321','human','air',1,?)",
+        (legacy_unjoined_sid, json.dumps({"score": 0, "kills": 0})))
+    connection.execute(
+        "INSERT INTO samples(sid,uid,player_name,mode,team,stats_json) "
+        "VALUES(?,'987654322','human','air',1,?)",
+        (legacy_human_sid, json.dumps({"score": 100})))
+    connection.execute(
+        "INSERT INTO replays(sid,mode,status,processed_at,team_br_json) "
+        "VALUES(?,'realistic','done',0,?)",
+        (legacy_unjoined_sid, json.dumps({"1": None, "2": {"min": 2.7,
+            "max": 2.7, "average_squad_br": 2.7}})))
+assert server.fill_saved_bot_team_brs() == 2
 with server.db() as connection:
     assert tuple(connection.execute(
         "SELECT team1_br_min,team1_br_max,team1_average_squad_br "
@@ -252,6 +264,12 @@ with server.db() as connection:
     assert connection.execute(
         "SELECT team1_br_min FROM battle.matches WHERE sid=?",
         (legacy_human_sid,)).fetchone()[0] is None
+    assert connection.execute(
+        "SELECT team1_br_min FROM battle.matches WHERE sid=?",
+        (legacy_unjoined_sid,)).fetchone()[0] == 2.7
+    assert json.loads(connection.execute(
+        "SELECT team_br_json FROM replays WHERE sid=?",
+        (legacy_unjoined_sid,)).fetchone()[0])["1"]["min"] == 2.7
     rows = list(server.battle_csv_rows(connection))
     assert rows[0][-1] == "match_br_range"
     assert "team1_br_range" not in rows[0] and "team2_br_range" not in rows[0]

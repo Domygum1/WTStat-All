@@ -500,9 +500,10 @@ def fill_saved_bot_team_brs() -> int:
         for row in rows:
             if rating_tick(row["match_br_max"], row["mode"]) is None:
                 continue
-            occupied = {sample[0] for sample in connection.execute(
-                f"SELECT DISTINCT team FROM samples WHERE sid=? AND {VALID_SAMPLE_SQL} "
-                "AND team IN (1,2)", (row["sid"],))}
+            occupied = {sample["team"] for sample in connection.execute(
+                f"SELECT team,configured_vehicles,stats_json FROM samples "
+                f"WHERE sid=? AND {VALID_SAMPLE_SQL} AND team IN (1,2)",
+                (row["sid"],)) if saved_participation_evidence(sample)}
             missing = 1 if row["team1_br_min"] is None else 2
             if occupied != {3 - missing}:
                 continue
@@ -511,6 +512,15 @@ def fill_saved_bot_team_brs() -> int:
                 f"UPDATE battle.matches SET {prefix}_br_min=?,{prefix}_br_max=?,"
                 f"{prefix}_average_squad_br=? WHERE sid=?",
                 (row["match_br_max"],) * 3 + (row["sid"],))
+            replay = connection.execute(
+                "SELECT team_br_json FROM replays WHERE sid=?", (row["sid"],)).fetchone()
+            if replay is not None:
+                teams, _ = decoded_team_br(replay["team_br_json"])
+                teams[str(missing)] = {"min": row["match_br_max"],
+                                       "max": row["match_br_max"],
+                                       "average_squad_br": row["match_br_max"]}
+                connection.execute("UPDATE replays SET team_br_json=? WHERE sid=?",
+                                   (json.dumps(teams), row["sid"]))
             filled += 1
     if filled:
         runtime["revision"] += 1
