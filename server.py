@@ -918,7 +918,7 @@ def repair_old_missing_lineups() -> None:
             "AND r.group_name IN ('air','ground') "
             "AND (b.match_br_min IS NULL OR b.match_br_max IS NULL) "
             "AND (a.sid IS NULL OR (a.retryable=1 AND a.checked_at<?)) "
-            "ORDER BY r.processed_at DESC LIMIT 2",
+            "ORDER BY r.processed_at DESC LIMIT 10",
             (time.time() - 3600,)).fetchall()
     changed = False
     for row in rows:
