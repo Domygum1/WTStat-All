@@ -50,9 +50,9 @@ guard = threading.RLock()
 stop_event = threading.Event()
 active_sids: set[str] = set()
 worker_thread: threading.Thread | None = None
-runtime = {"running": False, "stopping": False, "page": 1, "official_total": None,
+runtime = {"running": False, "stopping": False, "page": 1,
            "processed": 0, "errors": 0, "pending": 0, "samples": 0, "revision": 0,
-           "last_error": None, "active": 0, "scanned_pages": 0}
+           "last_error": None, "active": 0}
 
 
 @contextmanager
@@ -130,10 +130,10 @@ def init_db() -> None:
                 "SELECT sid FROM battle.matches WHERE match_br_min IS NULL "
                 "OR match_br_max IS NULL)")
             connection.execute("INSERT INTO settings VALUES('team_interval_repair_v3','1')")
-        connection.execute("CREATE TABLE IF NOT EXISTS official_replays ("
-                           "sid TEXT PRIMARY KEY, start_utc TEXT, group_name TEXT NOT NULL)")
-        connection.execute("CREATE INDEX IF NOT EXISTS official_replays_group "
-                           "ON official_replays(group_name)")
+        connection.execute("DROP TABLE IF EXISTS official_replays")
+        connection.execute("DELETE FROM settings WHERE key IN ("
+                           "'official_index_initialized','official_index_complete',"
+                           "'capture_modes_seen')")
         replay_columns = {row["name"] for row in connection.execute("PRAGMA table_info(replays)")}
         if "team_br_json" not in replay_columns:
             connection.execute("ALTER TABLE replays ADD COLUMN team_br_json TEXT")
@@ -162,20 +162,6 @@ def init_db() -> None:
         for key, value in (("page", 1), ("concurrency", 2), ("keep_files", 100),
                            ("capture_mode", "all")):
             connection.execute("INSERT OR IGNORE INTO settings VALUES(?,?)", (key, str(value)))
-        if not connection.execute(
-                "SELECT 1 FROM settings WHERE key='official_index_initialized'").fetchone():
-            # Earlier versions did not retain list-only results. Revisit page one
-            # once to index both modes; completed replays will not be downloaded again.
-            connection.execute("UPDATE settings SET value='1' WHERE key='page'")
-            connection.execute("INSERT INTO settings VALUES('official_index_initialized','1')")
-            connection.execute("INSERT OR REPLACE INTO settings VALUES('official_index_complete','0')")
-        if not connection.execute(
-                "SELECT 1 FROM settings WHERE key='capture_modes_seen'").fetchone():
-            modes = {row[0] for row in connection.execute(
-                "SELECT DISTINCT group_name FROM replays WHERE status='done' "
-                "AND group_name IN ('air','ground')")}
-            connection.execute("INSERT INTO settings VALUES('capture_modes_seen',?)",
-                               (",".join(sorted(modes)),))
         if not connection.execute("SELECT 1 FROM settings WHERE key='keep_files_default_100'").fetchone():
             connection.execute("UPDATE settings SET value='100' WHERE key='keep_files' AND value='10'")
             connection.execute("INSERT INTO settings VALUES('keep_files_default_100','1')")
@@ -912,22 +898,6 @@ def process_replay(item: dict) -> None:
 
 
 def process_page(items: list[dict]) -> None:
-    official_rows = []
-    for item in items:
-        sid = str(item.get("sessionIdHex") or "").lower()
-        if (len(sid) != 16 or any(char not in "0123456789abcdef" for char in sid)
-                or item.get("gameMode") != "realistic"
-                or item.get("gameType") not in (None, "randomBattle")
-                or item.get("isCompleted") is False
-                or item.get("statisticGroup") not in GROUPS):
-            continue
-        official_rows.append((sid, start_time(item), GROUPS[item["statisticGroup"]]))
-    if official_rows:
-        with db() as connection:
-            connection.executemany(
-                "INSERT INTO official_replays(sid,start_utc,group_name) VALUES(?,?,?) "
-                "ON CONFLICT(sid) DO UPDATE SET start_utc=excluded.start_utc,"
-                "group_name=excluded.group_name", official_rows)
     capture_mode = capture_mode_setting()
     candidates = [item for item in items if item.get("statisticGroup") in GROUPS
                   and (capture_mode == "all" or GROUPS[item["statisticGroup"]] == capture_mode)
@@ -1078,10 +1048,7 @@ def scan_loop() -> None:
             listing = fetch_page(page)
             with guard:
                 runtime["page"] = page
-                runtime["official_total"] = listing["total_count"]
-                runtime["scanned_pages"] += 1
             if not listing["items"]:
-                save_setting("official_index_complete", 1)
                 save_setting("page", 1)
                 stop_event.wait(30)
                 continue
@@ -1111,48 +1078,7 @@ def status_data() -> dict:
     snapshot["capture_mode"] = capture_mode_setting()
     snapshot["saved_files"] = sum(1 for _ in CACHE.glob("*/*.wrpl"))
     snapshot["cookie_configured"] = bool(wt.cookie())
-    snapshot["coverage"] = coverage_data()
     return snapshot
-
-
-def coverage_data() -> dict:
-    with db() as connection:
-        saved = connection.execute(
-            "SELECT value FROM settings WHERE key='capture_modes_seen'").fetchone()
-        modes = {mode for mode in (saved["value"].split(",") if saved else [])
-                 if mode in ("air", "ground")}
-        current = connection.execute(
-            "SELECT value FROM settings WHERE key='capture_mode'").fetchone()
-        current_mode = current["value"] if current else "all"
-        modes.update(("air", "ground") if current_mode == "all" else (current_mode,))
-        modes.update(row[0] for row in connection.execute(
-            "SELECT DISTINCT group_name FROM replays WHERE status='done' "
-            "AND group_name IN ('air','ground')"))
-        rows = connection.execute(
-            "SELECT o.group_name,COUNT(*) AS official_count,"
-            "SUM(CASE WHEN r.status='done' AND EXISTS ("
-            "SELECT 1 FROM samples s WHERE s.sid=o.sid) THEN 1 ELSE 0 END) "
-            "AS collected_count FROM official_replays o "
-            "LEFT JOIN replays r ON r.sid=o.sid GROUP BY o.group_name").fetchall()
-        span = connection.execute(
-            "SELECT MIN(start_utc) AS earliest_utc,MAX(start_utc) AS latest_utc "
-            "FROM official_replays").fetchone()
-        complete = connection.execute(
-            "SELECT value FROM settings WHERE key='official_index_complete'").fetchone()
-    counts = {mode: {"official": 0, "collected": 0} for mode in ("air", "ground")}
-    for row in rows:
-        if row["group_name"] in counts:
-            counts[row["group_name"]] = {
-                "official": row["official_count"],
-                "collected": row["collected_count"] or 0}
-    official = sum(counts[mode]["official"] for mode in modes)
-    collected = sum(counts[mode]["collected"] for mode in modes)
-    is_complete = bool(complete and complete["value"] == "1")
-    return {"modes": sorted(modes), "by_mode": counts, "official": official,
-            "collected": collected,
-            "ratio": collected / official if is_complete and official else None,
-            "complete": is_complete,
-            "earliest_utc": span["earliest_utc"], "latest_utc": span["latest_utc"]}
 
 
 class Control(BaseModel):
@@ -1197,16 +1123,6 @@ def control(payload: Control):
                     raise HTTPException(409, "正在停止当前任务，请稍后重新启动。")
             else:
                 stop_event.clear()
-                with db() as connection:
-                    row = connection.execute(
-                        "SELECT value FROM settings WHERE key='capture_modes_seen'").fetchone()
-                    modes = set(row["value"].split(",")) if row else set()
-                    current = connection.execute(
-                        "SELECT value FROM settings WHERE key='capture_mode'").fetchone()["value"]
-                    modes.update(("air", "ground") if current == "all" else (current,))
-                    connection.execute(
-                        "INSERT OR REPLACE INTO settings VALUES('capture_modes_seen',?)",
-                        (",".join(sorted(modes & {"air", "ground"})),))
                 runtime["running"] = True
                 runtime["stopping"] = False
                 runtime["last_error"] = None
@@ -1232,7 +1148,6 @@ def update_settings(payload: Settings):
             save_setting("capture_mode", payload.capture_mode)
             save_setting("page", 1)
             runtime["page"] = 1
-            runtime["official_total"] = None
     prune_files()
     return status_data()
 
@@ -1310,17 +1225,13 @@ def clear_data():
         with db() as connection:
             deleted_replays = connection.execute("SELECT COUNT(*) FROM replays").fetchone()[0]
             deleted_samples = connection.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
-            for table in ("histogram", "samples", "replays", "official_replays",
+            for table in ("histogram", "samples", "replays",
                           "lineup_repair_attempts"):
                 connection.execute(f"DELETE FROM {table}")
             connection.execute("DELETE FROM battle.matches")
             connection.execute("UPDATE settings SET value='1' WHERE key='page'")
-            connection.execute("INSERT OR REPLACE INTO settings "
-                               "VALUES('official_index_complete','0')")
-            connection.execute("INSERT OR REPLACE INTO settings "
-                               "VALUES('capture_modes_seen','')")
-        runtime.update(page=1, official_total=None, processed=0, errors=0, pending=0, samples=0,
-                       last_error=None, active=0, scanned_pages=0)
+        runtime.update(page=1, processed=0, errors=0, pending=0, samples=0,
+                       last_error=None, active=0)
         runtime["revision"] += 1
     return {"deleted_replays": deleted_replays, "deleted_samples": deleted_samples,
             "deleted_files": len(files), "status": status_data()}

@@ -54,7 +54,6 @@ assert server.wt_symbols_font().path.is_file()
 assert server.status()["cookie_configured"] is False
 server.update_settings(server.Settings(concurrency=2, keep_files=100,
                                        capture_mode="air"))
-assert server.coverage_data()["modes"] == ["air"]
 server.update_settings(server.Settings(concurrency=2, keep_files=100,
                                        capture_mode="all"))
 class EmptyListing:
@@ -355,26 +354,18 @@ official_items = [
     {"sessionIdHex": "3030303030303030", "startTime": 1791840002,
      "gameMode": "arcade", "gameType": "randomBattle",
      "statisticGroup": "aircraft", "isCompleted": True}]
-with patch.object(server, "process_replay"):
-    server.process_page(official_items)
-    server.process_page(official_items)
 with server.db() as connection:
-    connection.execute("INSERT INTO replays(sid,group_name,status,processed_at) "
-                       "VALUES('1010101010101010','air','done',0)")
-    connection.execute("INSERT INTO samples(sid,uid,mode) "
-                       "VALUES('1010101010101010','77','air')")
-server.save_setting("official_index_complete", 1)
-server.save_setting("capture_mode", "air")
-server.save_setting("capture_modes_seen", "air")
-coverage = server.coverage_data()
-assert coverage["official"] == coverage["collected"] == 1
-assert coverage["ratio"] == 1 and coverage["modes"] == ["air"]
-server.update_settings(server.Settings(concurrency=2, keep_files=100,
-                                       capture_mode="ground"))
-coverage = server.coverage_data()
-assert coverage["modes"] == ["air", "ground"]
-assert coverage["official"] == 2 and coverage["collected"] == 1
-assert coverage["ratio"] == 0.5 and coverage["complete"]
+    connection.execute("CREATE TABLE official_replays(sid TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO settings VALUES('official_index_complete','1')")
+server.init_db()
+with server.db() as connection:
+    assert connection.execute("SELECT 1 FROM sqlite_master WHERE name='official_replays'").fetchone() is None
+    assert connection.execute("SELECT 1 FROM settings WHERE key='official_index_complete'").fetchone() is None
+assert "coverage" not in server.status()
+with patch.object(server, "process_replay") as process:
+    server.process_page(official_items)
+    server.process_page(official_items)
+    assert process.call_count == 4
 with patch.object(zipfile, "ZIP64_LIMIT", 128):
     response = server.export_all_zip()
     with zipfile.ZipFile(response.path) as archive:
