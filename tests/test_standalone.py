@@ -38,6 +38,7 @@ import server
 import csv
 import json
 import sqlite3
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -356,6 +357,14 @@ coverage = server.coverage_data()
 assert coverage["modes"] == ["air", "ground"]
 assert coverage["official"] == 2 and coverage["collected"] == 1
 assert coverage["ratio"] == 0.5 and coverage["complete"]
+with patch.object(zipfile, "ZIP64_LIMIT", 128):
+    response = server.export_all_zip()
+    with zipfile.ZipFile(response.path) as archive:
+        names = archive.namelist()
+        assert len(names) == 2
+        players = archive.read(next(name for name in names if "players" in name))
+        assert len(players) > 128 and b"session_id" in players
+    Path(response.path).unlink()
 """
             environment = os.environ.copy()
             environment.pop("PYTHONPATH", None)

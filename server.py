@@ -1788,7 +1788,8 @@ def export_all_zip():
                                                  compresslevel=6, allowZip64=True) as archive:
             for name, rows in ((f"wtstat_all_battles_{stamp}.csv", battle_csv_rows(connection)),
                                (f"wtstat_all_players_{stamp}.csv", player_csv_rows(connection))):
-                with archive.open(name, "w") as entry:
+                # The player CSV can exceed 2 GiB; its size is unknown when opened.
+                with archive.open(name, "w", force_zip64=True) as entry:
                     with io.TextIOWrapper(entry, encoding="utf-8-sig", newline="") as text_file:
                         writer = csv.writer(text_file)
                         writer.writerows(rows)
