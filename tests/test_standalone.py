@@ -273,6 +273,17 @@ with server.db() as connection:
     assert tuple(connection.execute(
         "SELECT match_br_min,match_br_max FROM battle.matches WHERE sid=?",
         (lower_only_sid,)).fetchone()) == (2.7, 2.7)
+retry_sid = "4545454545454545"
+with server.db() as connection:
+    connection.execute("INSERT INTO battle.matches(sid,mode) VALUES(?,'air')",
+                       (retry_sid,))
+    connection.execute("INSERT INTO lineup_repair_attempts "
+                       "(sid,checked_at,retryable) VALUES(?,0,0)", (retry_sid,))
+    connection.execute("DELETE FROM settings WHERE key='team_interval_repair_v3'")
+server.init_db()
+with server.db() as connection:
+    assert connection.execute("SELECT 1 FROM lineup_repair_attempts WHERE sid=?",
+                              (retry_sid,)).fetchone() is None
 official_items = [
     {"sessionIdHex": "1010101010101010", "startTime": 1791840000,
      "gameMode": "realistic", "gameType": "randomBattle",

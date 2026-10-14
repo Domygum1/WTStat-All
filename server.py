@@ -123,6 +123,13 @@ def init_db() -> None:
                 "SELECT 1 FROM settings WHERE key='team_interval_repair_v2'").fetchone():
             connection.execute("DELETE FROM lineup_repair_attempts")
             connection.execute("INSERT INTO settings VALUES('team_interval_repair_v2','1')")
+        if not connection.execute(
+                "SELECT 1 FROM settings WHERE key='team_interval_repair_v3'").fetchone():
+            connection.execute(
+                "DELETE FROM lineup_repair_attempts WHERE sid IN ("
+                "SELECT sid FROM battle.matches WHERE match_br_min IS NULL "
+                "OR match_br_max IS NULL)")
+            connection.execute("INSERT INTO settings VALUES('team_interval_repair_v3','1')")
         connection.execute("CREATE TABLE IF NOT EXISTS official_replays ("
                            "sid TEXT PRIMARY KEY, start_utc TEXT, group_name TEXT NOT NULL)")
         connection.execute("CREATE INDEX IF NOT EXISTS official_replays_group "
