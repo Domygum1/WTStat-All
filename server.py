@@ -52,7 +52,7 @@ active_sids: set[str] = set()
 worker_thread: threading.Thread | None = None
 runtime = {"running": False, "stopping": False, "page": 1,
            "processed": 0, "errors": 0, "pending": 0, "samples": 0, "revision": 0,
-           "last_error": None, "active": 0}
+           "last_error": None, "cookie_expired": False, "active": 0}
 
 
 @contextmanager
@@ -539,15 +539,20 @@ def fetch_page(page: int) -> dict:
     response = wt.request("https://warthunder.com/en/api/replay", auth=True,
                           method="POST", payload=payload)
     try:
+        if response.status_code in (401, 403):
+            raise HTTPException(401, "identity_sid 登录状态可能已失效（官网返回 "
+                                f"HTTP {response.status_code}）；请重新登录官网并更新 config.local.json。")
         if response.status_code != 200:
             raise HTTPException(response.status_code, f"官网对局列表 HTTP {response.status_code}")
         if "json" not in response.headers.get("Content-Type", ""):
-            raise HTTPException(401, "官网没有返回 JSON；请检查 identity_sid。")
+            raise HTTPException(401, "官网未返回 Replay 数据；identity_sid 可能已失效。"
+                                "请重新登录官网并更新 config.local.json。")
         result = response.json()
         if not isinstance(result.get("items"), list) or not isinstance(result.get("total_count"), int):
             raise HTTPException(502, "官网对局列表格式已变化。")
         if result["total_count"] == 0:
-            raise HTTPException(401, "官网回放列表为空；identity_sid 可能已过期，请重新登录。")
+            raise HTTPException(401, "官网无筛选回放列表返回 0 场；identity_sid 可能已失效或官网暂时异常。"
+                                "请重新登录官网并更新 config.local.json。")
         return result
     finally:
         response.close()
@@ -1061,6 +1066,7 @@ def scan_loop() -> None:
     except HTTPException as error:
         with guard:
             runtime["last_error"] = f"官网列表：{error.detail}"
+            runtime["cookie_expired"] = error.status_code == 401
     except Exception as error:
         with guard:
             runtime["last_error"] = f"扫描中断：{type(error).__name__}: {error}"
@@ -1126,6 +1132,7 @@ def control(payload: Control):
                 runtime["running"] = True
                 runtime["stopping"] = False
                 runtime["last_error"] = None
+                runtime["cookie_expired"] = False
                 worker_thread = threading.Thread(target=scan_loop, name="wtstat-all-scan", daemon=True)
                 worker_thread.start()
         else:
@@ -1231,7 +1238,7 @@ def clear_data():
             connection.execute("DELETE FROM battle.matches")
             connection.execute("UPDATE settings SET value='1' WHERE key='page'")
         runtime.update(page=1, processed=0, errors=0, pending=0, samples=0,
-                       last_error=None, active=0)
+                       last_error=None, cookie_expired=False, active=0)
         runtime["revision"] += 1
     return {"deleted_replays": deleted_replays, "deleted_samples": deleted_samples,
             "deleted_files": len(files), "status": status_data()}
@@ -1655,13 +1662,10 @@ def player_csv_rows(connection: sqlite3.Connection):
 
 
 def battle_csv_rows(connection: sqlite3.Connection):
-    yield (*BATTLE_COLUMNS, "match_br_range")
+    yield BATTLE_COLUMNS
     for row in connection.execute(
         f"SELECT {','.join(BATTLE_COLUMNS)} FROM battle.matches ORDER BY sid"):
-        data = dict(row)
-        low, high = data["match_br_min"], data["match_br_max"]
-        match_range = f"[{low:.1f},{high:.1f}]" if low is not None and high is not None else ""
-        yield (*row, match_range)
+        yield tuple(row)
 
 
 def csv_chunks(rows):

@@ -66,8 +66,27 @@ with patch.object(server.wt, "request", return_value=EmptyListing()):
         server.fetch_page(1)
     except server.HTTPException as error:
         assert error.status_code == 401
+        assert "config.local.json" in error.detail
     else:
         raise AssertionError("An expired login must not count as zero battles")
+class UnauthorizedListing(EmptyListing):
+    status_code = 403
+with patch.object(server.wt, "request", return_value=UnauthorizedListing()):
+    try:
+        server.fetch_page(1)
+    except server.HTTPException as error:
+        assert error.status_code == 401 and "HTTP 403" in error.detail
+    else:
+        raise AssertionError("An unauthorized replay listing must report a cookie error")
+with patch.object(server, "retry_pending"), \
+     patch.object(server, "repair_old_missing_lineups"), \
+     patch.object(server, "fetch_page", side_effect=server.HTTPException(401, "Cookie expired")):
+    server.runtime["running"] = True
+    server.scan_loop()
+assert server.status()["cookie_expired"] and "Cookie expired" in server.status()["last_error"]
+assert not server.status()["running"]
+server.runtime["cookie_expired"] = False
+server.runtime["last_error"] = None
 assert server.is_real_player("123", "notrobot_1")
 assert not server.is_real_player("-12", "player")
 assert not server.is_real_player("0", "player")
@@ -270,10 +289,10 @@ with server.db() as connection:
         "SELECT team_br_json FROM replays WHERE sid=?",
         (legacy_unjoined_sid,)).fetchone()[0])["1"]["min"] == 2.7
     rows = list(server.battle_csv_rows(connection))
-    assert rows[0][-1] == "match_br_range"
-    assert "team1_br_range" not in rows[0] and "team2_br_range" not in rows[0]
+    assert rows[0] == server.BATTLE_COLUMNS
+    assert not any(column.endswith("_br_range") for column in rows[0])
     assert len(rows[0]) == len(rows[-1])
-    assert next(row[-1] for row in rows[1:] if row[0] == legacy_bot_sid) == "[2.7,2.7]"
+    assert next(row[8] for row in rows[1:] if row[0] == legacy_bot_sid) == 2.7
 with server.db() as connection:
     connection.execute("INSERT INTO battle.matches(sid,mode) VALUES('ffffffffffffffff','air')")
     connection.execute("INSERT INTO replays(sid,mode,group_name,status,processed_at) "
