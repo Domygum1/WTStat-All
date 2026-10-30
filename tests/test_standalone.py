@@ -440,8 +440,16 @@ with server.db() as connection:
     assert all(row[-1] == 150 for row in exported[1:] if row[0] == new_sid)
     connection.execute("INSERT INTO replays(sid,mode,group_name,status,processed_at) "
                        "VALUES('abababababababad','realistic','air','done',0)")
+    connection.execute("DELETE FROM settings WHERE key='sid_width_rescan_v1'")
+server.save_setting("page", 37)
 server.init_db()
+assert server.setting("page", 0) == 1
+server.save_setting("page", 37)
+server.init_db()
+assert server.setting("page", 0) == 37
 with server.db() as connection:
+    assert connection.execute("SELECT COUNT(*) FROM samples WHERE sid=?",
+                              (short_sid,)).fetchone()[0] == 2
     assert connection.execute("SELECT br_ceiling_tick FROM replays "
                               "WHERE sid='abababababababad'").fetchone()[0] == 147
 with patch.object(zipfile, "ZIP64_LIMIT", 128):

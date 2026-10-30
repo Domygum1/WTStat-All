@@ -186,6 +186,12 @@ def init_db() -> None:
         for key, value in (("page", 1), ("concurrency", 2), ("keep_files", 100),
                            ("capture_mode", "all")):
             connection.execute("INSERT OR IGNORE INTO settings VALUES(?,?)", (key, str(value)))
+        if not connection.execute(
+                "SELECT 1 FROM settings WHERE key='sid_width_rescan_v1'").fetchone():
+            # Earlier builds silently skipped every replay whose API ID had fewer than 16 digits.
+            # Rescan once from the latest page; existing completed sessions remain deduplicated.
+            connection.execute("UPDATE settings SET value='1' WHERE key='page'")
+            connection.execute("INSERT INTO settings VALUES('sid_width_rescan_v1','1')")
         if not connection.execute("SELECT 1 FROM settings WHERE key='keep_files_default_100'").fetchone():
             connection.execute("UPDATE settings SET value='100' WHERE key='keep_files' AND value='10'")
             connection.execute("INSERT INTO settings VALUES('keep_files_default_100','1')")
