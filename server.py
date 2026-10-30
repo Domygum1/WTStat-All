@@ -265,10 +265,12 @@ remove_saved_bots()
 
 
 def remove_unjoined_samples() -> int:
-    """Discard legacy team-0 roster entries that have no lineup or activity."""
+    """Discard known nonparticipants, even when the roster assigned them a team."""
     with db() as connection:
         rows = connection.execute(
-            "SELECT sid,uid,configured_vehicles,stats_json FROM samples WHERE team=0"
+            "SELECT sid,uid,configured_vehicles,stats_json FROM samples "
+            "WHERE (configured_vehicles IS NULL OR configured_vehicles='[]') "
+            "AND stats_json IS NOT NULL"
         ).fetchall()
         unwanted = []
         for row in rows:
@@ -348,10 +350,10 @@ def team_br_summary(players: list[dict], mode: str,
 
 
 def rated_real_players(data: dict) -> tuple[list[dict], float | None]:
-    """Ignore system bots before resolving lineups, squads, and match BR."""
+    """Ignore system bots and nonparticipants before resolving battle ratings."""
     players = [player for player in data.get("players") or []
                if is_real_player(player.get("uid"), player.get("name"))
-               and not wt.is_unjoined_player(player)]
+               and wt.has_participation_evidence(player)]
     rated = {**data, "players": players}
     wt.add_battle_ratings(rated)
     return players, rated.get("match_br")
@@ -1891,8 +1893,8 @@ def import_csv_file(path: Path) -> dict:
                     vehicles = json_field(row["configured_vehicles_json"], line, "配置载具", list)
                     stats = json_field(row["stats_json"], line, "战绩", dict)
                     team = integer(row["team"], line, "team", 0, 2)
-                    if (team == 0 and not (json.loads(vehicles) if vehicles else [])
-                            and not wt.has_activity(json.loads(stats) if stats else {})):
+                    if (stats is not None and not (json.loads(vehicles) if vehicles else [])
+                            and not wt.has_activity(json.loads(stats))):
                         skipped_samples += 1
                         continue
                     start = row.get("replay_start_utc") or (battle["start_utc"] if battle else None)

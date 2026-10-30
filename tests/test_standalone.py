@@ -61,6 +61,13 @@ player = {"uid": "1", "name": "test", "team": 1, "squad_id": None,
 data = {"game_mode": "realistic", "battle_group": "aircraft", "players": [player]}
 replay_core.add_battle_ratings(data)
 assert data["match_br"] == player["squad_br"] == 2.7
+unjoined = {"uid": "2", "name": "unjoined", "team": 2, "squad_id": None,
+            "auto_squad": True, "configured": [], "score": 0}
+participants, match_br = server.rated_real_players(
+    {"game_mode": "realistic", "battle_group": "aircraft",
+     "players": [player, unjoined]})
+assert [member["uid"] for member in participants] == ["1"]
+assert match_br == 2.7
 assert server.index().path.is_file()
 assert server.wt_symbols_font().path.is_file()
 assert server.status()["cookie_configured"] is False
@@ -127,8 +134,8 @@ phantom = {"uid": "3", "name": "not joined", "team": 0, "auto_squad": False,
 real, match_br = server.rated_real_players({
     "game_mode": "realistic", "battle_group": "aircraft",
     "players": [human, unspawned, phantom]})
-assert [item["uid"] for item in real] == ["1", "2"]
-assert match_br == 2.7 and unspawned["squad_br"] is None
+assert [item["uid"] for item in real] == ["1"]
+assert match_br == 2.7 and "squad_br" not in unspawned
 one_human_team = server.team_br_summary(real, "air", match_br)
 assert one_human_team["1"]["min"] == 2.7
 assert one_human_team["2"] == {"min": 2.7, "max": 2.7,
@@ -235,9 +242,12 @@ with path.open("w", newline="", encoding="utf-8") as file:
                       ("125", "coop/Bot57"), ("126", "real_player")]:
         writer.writerow({"session_id": "abcdef0123456789", "uid": uid,
                          "player_name": name, "mode": "air"})
+    writer.writerow({"session_id": "abcdef0123456789", "uid": "127",
+                     "player_name": "unjoined", "mode": "air", "team": 2,
+                     "stats_json": '{"score":0,"kills":0}'})
 result = server.import_csv_file(path)
 assert result["imported_samples"] == 1
-assert result["skipped_samples"] == 3
+assert result["skipped_samples"] == 4
 with server.db() as connection:
     assert connection.execute("SELECT br_ceiling_tick FROM replays WHERE sid='abcdef0123456789'").fetchone()[0] == 147
 with server.db() as connection:
@@ -330,15 +340,15 @@ with server.db() as connection:
         [("401", 1, "solo:401", '[{"code":"a-20g"}]', '{"score":300}'),
          ("402", 2, "solo:402", None, '{"score":0}'),
          ("403", 0, None, None, '{"score":0}')])
-assert server.remove_unjoined_samples() == 1
+assert server.remove_unjoined_samples() == 3
 assert server.repair_missing_battle_ratings()["repaired"] == 1
 with server.db() as connection:
     assert [row[0] for row in connection.execute(
-        "SELECT uid FROM samples WHERE sid='ffffffffffffffff' ORDER BY uid")] == ["401", "402"]
+        "SELECT uid FROM samples WHERE sid='ffffffffffffffff' ORDER BY uid")] == ["401"]
     assert tuple(connection.execute(
         "SELECT match_br_min,match_br_max FROM battle.matches "
         "WHERE sid='ffffffffffffffff'").fetchone()) == (2.7, 2.7)
-    assert connection.execute("SELECT squad_br FROM samples WHERE uid='402'").fetchone()[0] is None
+    assert connection.execute("SELECT 1 FROM samples WHERE uid='987654321'").fetchone() is None
 assert server.repair_missing_battle_ratings()["repaired"] == 0
 legacy_sid = "1212121212121212"
 with server.db() as connection:
