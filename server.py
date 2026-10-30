@@ -29,6 +29,23 @@ if not wt.wiki_catalog():
     raise RuntimeError("缺少本目录 data/wiki_vehicles.csv 或载具表无效。")
 if not wt.PARSER.is_file():
     raise RuntimeError("缺少本目录 bin/wtstat_results.exe。")
+
+
+def rating_ceilings() -> dict[str, int]:
+    """Use the current Wiki RB values, including aircraft in ground battles."""
+    vehicles = wt.wiki_catalog().values()
+    air = [row["br_rb"] for row in vehicles
+           if row["category"] == "aviation" and row["br_rb"] is not None]
+    ground = [row["br_ground_rb"] if row["category"] == "aviation" else row["br_rb"]
+              for row in vehicles
+              if row["category"] in ("aviation", "ground", "helicopters")]
+    ground = [value for value in ground if value is not None]
+    if not air or not ground:
+        raise RuntimeError("Wiki 权重表缺少空战或陆战历史权重。")
+    return {"air": round(max(air) * 10), "ground": round(max(ground) * 10)}
+
+
+BR_CEILINGS = rating_ceilings()
 DB = ROOT / "data" / "wtstat_all.sqlite3"
 BATTLE_DB = ROOT / "data" / "battles.sqlite3"
 CACHE = ROOT / "cache" / "replays"
@@ -110,7 +127,8 @@ def init_db() -> None:
         connection.execute("CREATE TABLE IF NOT EXISTS replays ("
                            "sid TEXT PRIMARY KEY, start_utc TEXT, map TEXT, mode TEXT, group_name TEXT, "
                            "last_part INTEGER, status TEXT NOT NULL, error TEXT, player_count INTEGER, "
-                           "match_br REAL, processed_at REAL NOT NULL, team_br_json TEXT)")
+                           "match_br REAL, processed_at REAL NOT NULL, team_br_json TEXT, "
+                           "br_ceiling_tick INTEGER)")
         connection.execute("CREATE TABLE IF NOT EXISTS lineup_repair_attempts ("
                            "sid TEXT PRIMARY KEY, checked_at REAL NOT NULL, "
                            "retryable INTEGER NOT NULL DEFAULT 0)")
@@ -137,6 +155,12 @@ def init_db() -> None:
         replay_columns = {row["name"] for row in connection.execute("PRAGMA table_info(replays)")}
         if "team_br_json" not in replay_columns:
             connection.execute("ALTER TABLE replays ADD COLUMN team_br_json TEXT")
+        if "br_ceiling_tick" not in replay_columns:
+            connection.execute("ALTER TABLE replays ADD COLUMN br_ceiling_tick INTEGER")
+        # Existing BR values came from the previous 14.7 / 13.0 catalog.
+        connection.execute("UPDATE replays SET br_ceiling_tick=CASE group_name "
+                           "WHEN 'air' THEN 147 WHEN 'ground' THEN 130 END "
+                           "WHERE br_ceiling_tick IS NULL AND status='done'")
         connection.execute("CREATE TABLE IF NOT EXISTS samples ("
                            "sid TEXT NOT NULL, uid TEXT NOT NULL, player_name TEXT, country TEXT, "
                            "squad_br REAL, match_br REAL, mode TEXT NOT NULL, "
@@ -181,7 +205,9 @@ def rating_tick(value, mode: str) -> int | None:
     if not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
     tick = round(value * 10)
-    limit = 147 if mode == "air" else 130
+    limit = BR_CEILINGS.get(mode)
+    if limit is None:
+        return None
     if abs(value * 10 - tick) > 0.001 or not 10 <= tick <= limit or tick % 10 not in (0, 3, 7):
         return None
     return tick
@@ -257,7 +283,9 @@ remove_unjoined_samples()
 
 
 def possible_ticks(mode: str) -> list[int]:
-    limit = 147 if mode == "air" else 130
+    limit = BR_CEILINGS.get(mode)
+    if limit is None:
+        return []
     return [tick for tick in range(10, limit + 1) if tick % 10 in (0, 3, 7)]
 
 
@@ -453,8 +481,9 @@ def repair_missing_battle_ratings() -> dict[str, int]:
                 (lower, match_br,
                  *(side.get(field) if side else None for side in sides
                    for field in ("min", "max", "average_squad_br")), sid))
-            connection.execute("UPDATE replays SET match_br=?,team_br_json=? WHERE sid=?",
-                               (match_br, json.dumps(teams), sid))
+            connection.execute("UPDATE replays SET match_br=?,team_br_json=?,"
+                               "br_ceiling_tick=? WHERE sid=?",
+                               (match_br, json.dumps(teams), BR_CEILINGS[mode], sid))
             connection.executemany(
                 "UPDATE samples SET squad_br=?,match_br=? WHERE sid=? AND uid=?",
                 ((squad_by_uid.get(row["uid"]), match_br, sid, row["uid"])
@@ -861,15 +890,16 @@ def process_replay(item: dict) -> None:
             replay_start = start_time(item)
             connection.execute(
                 "INSERT INTO replays(sid,start_utc,map,mode,group_name,last_part,status,error,"
-                "player_count,match_br,processed_at,team_br_json) "
-                "VALUES(?,?,?,?,?,?,'done',NULL,?,?,?,?) "
+                "player_count,match_br,processed_at,team_br_json,br_ceiling_tick) "
+                "VALUES(?,?,?,?,?,?,'done',NULL,?,?,?,?,?) "
                 "ON CONFLICT(sid) DO UPDATE SET start_utc=excluded.start_utc,map=excluded.map,"
                 "mode=excluded.mode,group_name=excluded.group_name,last_part=excluded.last_part,"
                 "status='done',error=NULL,player_count=excluded.player_count,"
                 "match_br=excluded.match_br,processed_at=excluded.processed_at,"
-                "team_br_json=excluded.team_br_json",
+                "team_br_json=excluded.team_br_json,br_ceiling_tick=excluded.br_ceiling_tick",
                 (sid, replay_start, item.get("missionName"), "realistic", mode,
-                 last_part, len(data["players"]), match_br, processed_at, team_summary))
+                 last_part, len(data["players"]), match_br, processed_at, team_summary,
+                 BR_CEILINGS[mode]))
             save_battle(connection, battle_values(
                 sid, replay_start, item.get("missionName"), mode, len(data["players"]),
                 last_part, processed_at, match_br, team_summary))
@@ -1006,8 +1036,9 @@ def repair_old_missing_lineups() -> None:
                          json.dumps({key: player.get(key) for key in PLAYER_STAT_FIELDS},
                                     ensure_ascii=False), player.get("team")))
                 save_battle(connection, values)
-                connection.execute("UPDATE replays SET match_br=?,team_br_json=? "
-                                   "WHERE sid=?", (match_br, summary, sid))
+                connection.execute("UPDATE replays SET match_br=?,team_br_json=?,"
+                                   "br_ceiling_tick=? WHERE sid=?",
+                                   (match_br, summary, BR_CEILINGS[row["group_name"]], sid))
                 connection.execute(
                     "INSERT OR REPLACE INTO lineup_repair_attempts "
                     "(sid,checked_at,retryable) VALUES(?,?,0)",
@@ -1079,6 +1110,7 @@ def scan_loop() -> None:
 def status_data() -> dict:
     with guard:
         snapshot = dict(runtime)
+    snapshot["br_ceilings"] = {mode: tick / 10 for mode, tick in BR_CEILINGS.items()}
     snapshot["concurrency"] = setting("concurrency", 2)
     snapshot["keep_files"] = setting("keep_files", 100)
     snapshot["capture_mode"] = capture_mode_setting()
@@ -1272,10 +1304,10 @@ def weighted_summary(counts: Counter[int]) -> dict:
 
 
 def rate_bucket(mode: str, squad_tick: int, match_tick: int,
-                minimum_tick: int | None) -> str | None:
+                minimum_tick: int | None, ceiling_tick: int | None = None) -> str | None:
     # Near the BR ceiling, the maximum alone cannot describe the lobby's range.
     # Compare these squads with the lowest effective squad BR in their match.
-    ceiling = 147 if mode == "air" else 130
+    ceiling = ceiling_tick or BR_CEILINGS[mode]
     ceiling_group = ceiling - squad_tick < 10
     if ceiling_group:
         if minimum_tick is None:
@@ -1294,7 +1326,8 @@ def party_distribution(mode: str, composition_filter: tuple[str, ...] | None,
                        party_size: int | None, time_start: int = 0,
                        time_end: int = 1440, tz_offset: int = 0
                        ) -> tuple[dict[int, Counter[int]], dict[int, Counter[str]],
-                                  dict[int, Counter[tuple[int | None, int]]]]:
+                                  dict[int, Counter[tuple[int | None, int]]],
+                                  dict[int, Counter[int]]]:
     """Count each squad once; recover complete legacy squads from member rows."""
     time_clause = ""
     time_params: tuple = ()
@@ -1313,12 +1346,14 @@ def party_distribution(mode: str, composition_filter: tuple[str, ...] | None,
         minima = {}
         for row in connection.execute(
             "SELECT s.sid, MIN(s.squad_br) AS minimum, COUNT(*) AS retained, "
-            "COUNT(s.squad_br) AS known "
-            "FROM samples s WHERE s.mode=?" +
+            "COUNT(s.squad_br) AS known, MAX(r.br_ceiling_tick) AS ceiling "
+            "FROM samples s LEFT JOIN replays r ON r.sid=s.sid WHERE s.mode=?" +
             time_clause + " GROUP BY s.sid", (mode, *time_params)
         ):
-            minima[row["sid"]] = (rating_tick(row["minimum"], mode)
-                                  if row["retained"] == row["known"] else None)
+            minima[row["sid"]] = (
+                rating_tick(row["minimum"], mode)
+                if row["retained"] == row["known"] else None,
+                row["ceiling"] or BR_CEILINGS[mode])
         rows = connection.execute(
             "SELECT s.sid,s.country,s.squad_br,s.match_br,s.squad_countries,s.party_key "
             "FROM samples s WHERE s.mode=?" + time_clause, (mode, *time_params))
@@ -1348,6 +1383,7 @@ def party_distribution(mode: str, composition_filter: tuple[str, ...] | None,
     grouped: dict[int, Counter[int]] = defaultdict(Counter)
     classified: dict[int, Counter[str]] = defaultdict(Counter)
     ranges: dict[int, Counter[tuple[int | None, int]]] = defaultdict(Counter)
+    ceiling_usage: dict[int, Counter[int]] = defaultdict(Counter)
 
     def add(sid: str, signature: tuple, count: int) -> None:
         composition, squad_tick, match_tick = signature
@@ -1358,9 +1394,10 @@ def party_distribution(mode: str, composition_filter: tuple[str, ...] | None,
         if composition_filter is not None and composition != composition_filter:
             return
         grouped[squad_tick][match_tick] += count
-        minimum_tick = minima.get(sid)
+        minimum_tick, ceiling_tick = minima.get(sid, (None, BR_CEILINGS[mode]))
         ranges[squad_tick][(minimum_tick, match_tick)] += count
-        bucket = rate_bucket(mode, squad_tick, match_tick, minimum_tick)
+        ceiling_usage[squad_tick][ceiling_tick] += count
+        bucket = rate_bucket(mode, squad_tick, match_tick, minimum_tick, ceiling_tick)
         if bucket:
             classified[squad_tick][bucket] += count
 
@@ -1373,7 +1410,7 @@ def party_distribution(mode: str, composition_filter: tuple[str, ...] | None,
         size = len(signature[0])
         if size and members % size == 0:
             add(sid, signature, members // size)
-    return grouped, classified, ranges
+    return grouped, classified, ranges, ceiling_usage
 
 
 @app.get("/api/analytics")
@@ -1405,7 +1442,7 @@ def analytics(mode: str = Query("air", pattern="^(air|ground)$"),
     if country and (any(not value for value in choices[:count]) or any(choices[count:])):
         raise HTTPException(400, "请选齐指定数量的队友国家。")
     composition_filter = (tuple(sorted((country, *choices[:count]))) if country else None)
-    grouped, classified, ranges = party_distribution(
+    grouped, classified, ranges, ceiling_usage = party_distribution(
         mode, composition_filter, count + 1 if count is not None else None,
         time_start, time_end, tz_offset)
     overview = []
@@ -1421,7 +1458,8 @@ def analytics(mode: str = Query("air", pattern="^(air|ground)$"),
                  "small_leader_rate": small_leader_count / n if n else None,
                  "small_underdog_rate": bucket_counts["small_underdog"] / n if n else None,
                  "big_underdog_rate": bucket_counts["big_underdog"] / n if n else None}
-        overview.append({"weight": group_tick / 10, **summary, **rates})
+        overview.append({"weight": group_tick / 10, **summary, **rates,
+                         "ceiling_ticks": sorted(ceiling_usage[group_tick])})
     chosen = next(row for row in overview if round(row["weight"] * 10) == tick)
     distribution = [{"min_br": low / 10 if low is not None else None,
                      "max_br": high / 10, "count": count}
@@ -1653,10 +1691,11 @@ def recent_detail(sid: str):
 def player_csv_rows(connection: sqlite3.Connection):
     yield ("session_id", "uid", "player_name", "research_country", "squad_br",
            "teammate_research_countries_json", "party_key", "configured_vehicles_json",
-           "stats_json", "team")
+           "stats_json", "team", "br_ceiling_tick")
     for row in connection.execute(
         "SELECT sid,uid,player_name,country,squad_br,squad_countries,party_key,"
-        "configured_vehicles,stats_json,team FROM samples "
+        "configured_vehicles,stats_json,team,"
+        "(SELECT br_ceiling_tick FROM replays WHERE replays.sid=samples.sid) FROM samples "
         f"WHERE {VALID_SAMPLE_SQL} ORDER BY sid,uid"):
         yield tuple(row)
 
@@ -1802,6 +1841,10 @@ def import_csv_file(path: Path) -> dict:
                     mode = (row.get("mode") or (battle["mode"] if battle else "") or "").strip()
                     if mode not in ("air", "ground"):
                         invalid(line, "缺少战局模式；请先导入战局 CSV。")
+                    ceiling_tick = integer(row.get("br_ceiling_tick"), line,
+                                           "br_ceiling_tick", 10, 200)
+                    if ceiling_tick is None:
+                        ceiling_tick = 147 if mode == "air" else 130
                     country = row["research_country"] or None
                     party_key = row["party_key"] or None
                     if any(value is not None and len(value) > limit for value, limit in
@@ -1846,7 +1889,7 @@ def import_csv_file(path: Path) -> dict:
                     if battle is None and "mode" not in row:
                         invalid(line, "找不到对应战局；请先导入战局 CSV。")
                     metadata = (mode, start, replay_map, player_count, last_part,
-                                match_br, processed_at, team_br_json)
+                                match_br, processed_at, team_br_json, ceiling_tick)
                     if sid in seen_replays and seen_replays[sid] != metadata:
                         invalid(line, "同一 Session 的对局元数据不一致。")
                     if sid not in seen_replays:
@@ -1854,10 +1897,11 @@ def import_csv_file(path: Path) -> dict:
                         cursor = connection.execute(
                             "INSERT OR IGNORE INTO replays "
                             "(sid,start_utc,map,mode,group_name,last_part,status,error,"
-                            "player_count,match_br,processed_at,team_br_json) "
-                            "VALUES(?,?,?,'realistic',?,?,'done',NULL,?,?,?,?)",
+                            "player_count,match_br,processed_at,team_br_json,br_ceiling_tick) "
+                            "VALUES(?,?,?,'realistic',?,?,'done',NULL,?,?,?,?,?)",
                             (sid, start, replay_map, mode, last_part, player_count, match_br,
-                             processed_at if processed_at is not None else time.time(), team_br_json))
+                             processed_at if processed_at is not None else time.time(),
+                             team_br_json, ceiling_tick))
                         if cursor.rowcount:
                             imported_replays += 1
                         else:
@@ -1866,10 +1910,11 @@ def import_csv_file(path: Path) -> dict:
                                 "map=COALESCE(map,?),last_part=COALESCE(last_part,?),"
                                 "player_count=COALESCE(player_count,?),match_br=COALESCE(match_br,?),"
                                 "team_br_json=COALESCE(team_br_json,?),"
+                                "br_ceiling_tick=COALESCE(br_ceiling_tick,?),"
                                 "mode=COALESCE(mode,'realistic'),group_name=COALESCE(group_name,?),"
                                 "status='done',error=NULL WHERE sid=?",
                                 (start, replay_map, last_part, player_count, match_br,
-                                 team_br_json, mode, sid))
+                                 team_br_json, ceiling_tick, mode, sid))
                         if battle is None:
                             save_battle(connection, battle_values(
                                 sid, start, replay_map, mode, player_count, last_part,

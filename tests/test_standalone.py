@@ -43,6 +43,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 assert replay_core.wiki_catalog()
+assert replay_core.vehicle_battle_rating("ef_2000a_aesa", "realistic", "aircraft") == 15.0
+assert replay_core.vehicle_battle_rating("ef_2000a_aesa", "realistic", "tank") == 14.0
+assert server.BR_CEILINGS == {"air": 150, "ground": 140}
+assert server.rating_tick(15.0, "air") == 150
+assert server.rating_tick(14.0, "ground") == 140
+assert server.possible_ticks("air")[-1] == 150
+assert server.possible_ticks("ground")[-1] == 140
+assert server.rate_bucket("air", 140, 150, 130) == "big_underdog"
+assert server.rate_bucket("air", 143, 150, 140) == "small_underdog"
+assert server.rate_bucket("ground", 133, 140, 130) == "small_underdog"
+assert server.rate_bucket("air", 140, 147, 137, 147) == "small_underdog"
+assert server.rate_bucket("air", 140, 150, 137, 150) == "big_underdog"
 assert replay_core.cookie() is None
 player = {"uid": "1", "name": "test", "team": 1, "squad_id": None,
           "auto_squad": True, "configured": [replay_core.vehicle("a-20g")]}
@@ -175,6 +187,8 @@ with sqlite3.connect(":memory:") as connection:
     connection.execute("CREATE TABLE samples (sid TEXT,uid TEXT,player_name TEXT,"
                        "country TEXT,squad_br REAL,squad_countries TEXT,party_key TEXT,"
                        "configured_vehicles TEXT,stats_json TEXT,team INTEGER)")
+    connection.execute("CREATE TABLE replays (sid TEXT PRIMARY KEY, br_ceiling_tick INTEGER)")
+    connection.execute("INSERT INTO replays VALUES('a',147)")
     connection.executemany("INSERT INTO samples(sid,uid,player_name) VALUES(?,?,?)", [
         ("a", "123", "real_player"),
         ("a", "124", "notrobot_1"),
@@ -186,6 +200,7 @@ with sqlite3.connect(":memory:") as connection:
     ])
     rows = list(server.player_csv_rows(connection))
     assert [row[1] for row in rows[1:]] == ["123", "124", "125"]
+    assert all(row[-1] == 147 for row in rows[1:])
 with server.db() as connection:
     connection.executemany(
         "INSERT INTO samples(sid,uid,player_name,mode,squad_br,match_br) VALUES(?,?,?,?,?,?)",
@@ -214,6 +229,8 @@ result = server.import_csv_file(path)
 assert result["imported_samples"] == 1
 assert result["skipped_samples"] == 3
 with server.db() as connection:
+    assert connection.execute("SELECT br_ceiling_tick FROM replays WHERE sid='abcdef0123456789'").fetchone()[0] == 147
+with server.db() as connection:
     assert [row[0] for row in connection.execute(
         "SELECT uid FROM samples ORDER BY uid")] == ["123", "126"]
     connection.executemany(
@@ -226,7 +243,7 @@ with server.db() as connection:
         [("bbbbbbbbbbbbbbbb", "201", "air", 2.7, 2.7, "solo:201"),
          ("cccccccccccccccc", "202", "air", 2.7, 2.7, "solo:202"),
          ("cccccccccccccccc", "203", "air", None, 2.7, "solo:203")])
-_, _, ranges = server.party_distribution("air", None, None)
+_, _, ranges, ceilings = server.party_distribution("air", None, None)
 assert ranges[27][(27, 27)] == 1  # A removed Bot does not hide the known lower bound.
 assert ranges[27][(None, 27)] == 1  # A retained player with no BR still does.
 
@@ -385,6 +402,22 @@ with patch.object(server, "process_replay") as process:
     server.process_page(official_items)
     server.process_page(official_items)
     assert process.call_count == 4
+new_sid = "abababababababac"
+with patch.object(server, "download_last_part", return_value=Path("ignored.wrpl")), \
+     patch.object(server, "parse_with_lineup_fallback", return_value={"players": [human, other_human]}):
+    server.process_replay({**bot_only_item, "sessionIdHex": new_sid})
+with server.db() as connection:
+    assert connection.execute("SELECT br_ceiling_tick FROM replays WHERE sid=?",
+                              (new_sid,)).fetchone()[0] == 150
+    exported = list(server.player_csv_rows(connection))
+    assert exported[0][-1] == "br_ceiling_tick"
+    assert all(row[-1] == 150 for row in exported[1:] if row[0] == new_sid)
+    connection.execute("INSERT INTO replays(sid,mode,group_name,status,processed_at) "
+                       "VALUES('abababababababad','realistic','air','done',0)")
+server.init_db()
+with server.db() as connection:
+    assert connection.execute("SELECT br_ceiling_tick FROM replays "
+                              "WHERE sid='abababababababad'").fetchone()[0] == 147
 with patch.object(zipfile, "ZIP64_LIMIT", 128):
     response = server.export_all_zip()
     with zipfile.ZipFile(response.path) as archive:
