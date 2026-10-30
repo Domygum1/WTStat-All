@@ -69,7 +69,7 @@ active_sids: set[str] = set()
 worker_thread: threading.Thread | None = None
 runtime = {"running": False, "stopping": False, "page": 1,
            "processed": 0, "errors": 0, "pending": 0, "samples": 0, "revision": 0,
-           "last_error": None, "cookie_expired": False, "active": 0}
+           "last_error": None, "cookie_expired": False, "phase": None, "active": 0}
 
 
 @contextmanager
@@ -1065,29 +1065,49 @@ def repair_old_missing_lineups() -> None:
 
 def scan_loop() -> None:
     try:
+        if stop_event.is_set():
+            return
+        # Check the authenticated listing before any potentially slow backlog work.
+        with guard:
+            runtime["phase"] = "正在验证官网登录"
+        latest_listing = fetch_page(1)
         pages_since_head = 20 if setting("page", 1) > 1 else 0
         while not stop_event.is_set():
             # Give settled replays a bounded, concurrent retry batch before new pages.
+            with guard:
+                runtime["phase"] = "正在补试待结算战局"
             retry_pending()
             if stop_event.is_set():
                 break
+            with guard:
+                runtime["phase"] = "正在检查旧战局"
             repair_old_missing_lineups()
             if stop_event.is_set():
                 break
             page = setting("page", 1)
             if page > 1 and pages_since_head >= 20:
-                listing = fetch_page(1)
+                with guard:
+                    runtime["phase"] = "正在处理最新战局"
+                listing = latest_listing if latest_listing is not None else fetch_page(1)
+                latest_listing = None
                 process_page(listing["items"])
                 pages_since_head = 0
                 if stop_event.is_set():
                     break
-            listing = fetch_page(page)
+            with guard:
+                runtime["phase"] = f"正在读取官网第 {page} 页"
+            listing = latest_listing if page == 1 and latest_listing is not None else fetch_page(page)
+            latest_listing = None
             with guard:
                 runtime["page"] = page
             if not listing["items"]:
                 save_setting("page", 1)
+                with guard:
+                    runtime["phase"] = "官网当前无新战局，30 秒后重试"
                 stop_event.wait(30)
                 continue
+            with guard:
+                runtime["phase"] = f"正在处理第 {page} 页"
             process_page(listing["items"])
             if stop_event.is_set():
                 break
@@ -1105,6 +1125,7 @@ def scan_loop() -> None:
         with guard:
             runtime["running"] = False
             runtime["stopping"] = False
+            runtime["phase"] = None
 
 
 def status_data() -> dict:
@@ -1165,6 +1186,7 @@ def control(payload: Control):
                 runtime["stopping"] = False
                 runtime["last_error"] = None
                 runtime["cookie_expired"] = False
+                runtime["phase"] = "正在验证官网登录"
                 worker_thread = threading.Thread(target=scan_loop, name="wtstat-all-scan", daemon=True)
                 worker_thread.start()
         else:
@@ -1270,7 +1292,7 @@ def clear_data():
             connection.execute("DELETE FROM battle.matches")
             connection.execute("UPDATE settings SET value='1' WHERE key='page'")
         runtime.update(page=1, processed=0, errors=0, pending=0, samples=0,
-                       last_error=None, cookie_expired=False, active=0)
+                       last_error=None, cookie_expired=False, phase=None, active=0)
         runtime["revision"] += 1
     return {"deleted_replays": deleted_replays, "deleted_samples": deleted_samples,
             "deleted_files": len(files), "status": status_data()}

@@ -90,15 +90,25 @@ with patch.object(server.wt, "request", return_value=UnauthorizedListing()):
         assert error.status_code == 401 and "HTTP 403" in error.detail
     else:
         raise AssertionError("An unauthorized replay listing must report a cookie error")
-with patch.object(server, "retry_pending"), \
+with patch.object(server, "retry_pending") as retry, \
      patch.object(server, "repair_old_missing_lineups"), \
      patch.object(server, "fetch_page", side_effect=server.HTTPException(401, "Cookie expired")):
     server.runtime["running"] = True
     server.scan_loop()
+    retry.assert_not_called()
 assert server.status()["cookie_expired"] and "Cookie expired" in server.status()["last_error"]
 assert not server.status()["running"]
+assert server.status()["phase"] is None
 server.runtime["cookie_expired"] = False
 server.runtime["last_error"] = None
+with patch.object(server, "fetch_page", return_value={"items": [{}]}) as fetch, \
+     patch.object(server, "retry_pending"), \
+     patch.object(server, "repair_old_missing_lineups"), \
+     patch.object(server, "process_page", side_effect=lambda _items: server.stop_event.set()):
+    server.runtime["running"] = True
+    server.scan_loop()
+    fetch.assert_called_once_with(1)
+server.stop_event.clear()
 assert server.is_real_player("123", "notrobot_1")
 assert not server.is_real_player("-12", "player")
 assert not server.is_real_player("0", "player")
