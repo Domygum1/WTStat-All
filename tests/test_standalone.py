@@ -40,7 +40,7 @@ import json
 import sqlite3
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 assert replay_core.wiki_catalog()
 assert replay_core.vehicle_battle_rating("ef_2000a_aesa", "realistic", "aircraft") == 15.0
@@ -416,7 +416,23 @@ new_sid = "abababababababac"
 with patch.object(server, "download_last_part", return_value=Path("ignored.wrpl")), \
      patch.object(server, "parse_with_lineup_fallback", return_value={"players": [human, other_human]}):
     server.process_replay({**bot_only_item, "sessionIdHex": new_sid})
+    short_sid = "be95b0800065709"
+    server.process_replay({**bot_only_item, "sessionIdHex": short_sid})
+assert server.valid_sid(short_sid)
+assert not server.valid_sid(short_sid + "00")
+response = Mock(status_code=200, headers={"Content-Length": "1235"})
+response.iter_content.return_value = [b"x" * 1235]
+with patch.object(server.wt, "request", return_value=response) as request:
+    assert server.download_last_part(short_sid, 1).is_file()
+    assert request.call_args.args[0].endswith("/0" + short_sid + "/0001.wrpl")
+with patch.object(server.wt, "request", return_value=Mock(status_code=404)) as request:
+    assert server.latest_published_part(short_sid, 2) is None
+    assert request.call_args.args[0].endswith("/0" + short_sid + "/0002.wrpl")
 with server.db() as connection:
+    assert connection.execute("SELECT status FROM replays WHERE sid=?",
+                              (short_sid,)).fetchone()[0] == "done"
+    assert connection.execute("SELECT COUNT(*) FROM samples WHERE sid=?",
+                              (short_sid,)).fetchone()[0] == 2
     assert connection.execute("SELECT br_ceiling_tick FROM replays WHERE sid=?",
                               (new_sid,)).fetchone()[0] == 150
     exported = list(server.player_csv_rows(connection))

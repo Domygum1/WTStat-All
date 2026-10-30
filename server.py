@@ -219,6 +219,11 @@ def is_real_player(uid: object, name: object) -> bool:
             and not (isinstance(name, str) and name.lower().startswith("coop/bot")))
 
 
+def valid_sid(sid: str) -> bool:
+    # The replay API omits leading zeroes, so newer session IDs can be 15 hex digits.
+    return 1 <= len(sid) <= 16 and all(char in "0123456789abcdef" for char in sid)
+
+
 def rebuild_histogram(connection: sqlite3.Connection) -> None:
     totals: Counter[tuple[str, str, int, int]] = Counter()
     for row in connection.execute(
@@ -596,7 +601,7 @@ def download_last_part(sid: str, part: int) -> Path:
     if path.exists() and path.stat().st_size > 1234:
         path.touch()
         return path
-    response = wt.request(f"{wt.FILES}/{sid}/{part:04d}.wrpl", stream=True)
+    response = wt.request(f"{wt.FILES}/{sid.zfill(16)}/{part:04d}.wrpl", stream=True)
     try:
         if response.status_code in (403, 404, 429):
             raise HTTPException(response.status_code, f"结算段 HTTP {response.status_code}")
@@ -671,7 +676,7 @@ def latest_published_part(sid: str, first: int) -> int | None:
     def exists(part: int) -> bool:
         nonlocal probes
         probes += 1
-        response = wt.request(f"{wt.FILES}/{sid}/{part:04d}.wrpl", stream=True)
+        response = wt.request(f"{wt.FILES}/{sid.zfill(16)}/{part:04d}.wrpl", stream=True)
         try:
             if response.status_code == 200:
                 return True
@@ -815,7 +820,7 @@ def party_key(player: dict) -> str | None:
 
 def process_replay(item: dict) -> None:
     sid = str(item.get("sessionIdHex") or "").lower()
-    if len(sid) != 16 or not all(char in "0123456789abcdef" for char in sid):
+    if not valid_sid(sid):
         return
     mode = GROUPS.get(item.get("statisticGroup"))
     if item.get("gameMode") != "realistic" or mode is None or item.get("isCompleted") is False:
@@ -1668,7 +1673,7 @@ def recent():
 @app.get("/api/recent/{sid}")
 def recent_detail(sid: str):
     sid = sid.strip().lower()
-    if len(sid) != 16 or any(char not in "0123456789abcdef" for char in sid):
+    if not valid_sid(sid):
         raise HTTPException(400, "Session ID 格式无效。")
     with db() as connection:
         replay = connection.execute(
@@ -1845,7 +1850,7 @@ def import_csv_file(path: Path) -> dict:
                         invalid(line, "列数与表头不一致。")
                     sid = row["session_id"].strip().lower()
                     uid = row["uid"].strip()
-                    if len(sid) != 16 or any(char not in "0123456789abcdef" for char in sid):
+                    if not valid_sid(sid):
                         invalid(line, "Session ID 无效。")
                     if uid.startswith("-") and uid[1:].isascii() and uid[1:].isdecimal():
                         skipped_samples += 1
@@ -1991,7 +1996,7 @@ def import_battles_file(path: Path) -> dict:
                         raise HTTPException(422, f"CSV 第 {line} 行：列数与表头不一致。")
                     sid = row["sid"].strip().lower()
                     mode = row["mode"].strip()
-                    if len(sid) != 16 or any(char not in "0123456789abcdef" for char in sid):
+                    if not valid_sid(sid):
                         raise HTTPException(422, f"CSV 第 {line} 行：Session ID 无效。")
                     if mode not in ("air", "ground"):
                         raise HTTPException(422, f"CSV 第 {line} 行：模式无效。")
