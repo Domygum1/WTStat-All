@@ -65,6 +65,7 @@ PLAYER_STAT_FIELDS = ("kills", "groundKills", "humanKills", "deaths", "assists",
 VALID_SAMPLE_SQL = ("uid <> '' AND uid NOT GLOB '*[^0-9]*' AND CAST(uid AS INTEGER)>0 "
                     "AND (player_name IS NULL OR LOWER(player_name) NOT LIKE 'coop/bot%')")
 guard = threading.RLock()
+db_write_guard = threading.Lock()
 stop_event = threading.Event()
 active_sids: set[str] = set()
 worker_thread: threading.Thread | None = None
@@ -87,6 +88,10 @@ def db():
         raise
     finally:
         connection.close()
+
+
+def database_is_locked(error: sqlite3.OperationalError) -> bool:
+    return "locked" in str(error).lower() or "busy" in str(error).lower()
 
 
 def setting(key: str, default: int) -> int:
@@ -748,7 +753,7 @@ def prune_files() -> None:
 
 def record_error(sid: str, item: dict, error: str, *, pending: bool = False) -> None:
     new_status = "pending" if pending else "error"
-    with db() as connection:
+    with db_write_guard, db() as connection:
         existing = connection.execute("SELECT status FROM replays WHERE sid=?", (sid,)).fetchone()
         if existing and existing["status"] == "done":
             return
@@ -776,7 +781,7 @@ def record_error(sid: str, item: dict, error: str, *, pending: bool = False) -> 
 def record_no_participants(sid: str, item: dict, player_count: int,
                            previous_status: str | None) -> None:
     """Remember an unplayed replay without adding it to battle or player statistics."""
-    with db() as connection:
+    with db_write_guard, db() as connection:
         connection.execute(
             "INSERT INTO replays(sid,start_utc,map,mode,group_name,last_part,status,"
             "error,player_count,match_br,processed_at) VALUES(?,?,?,?,?,?,'skipped',?,?,NULL,?) "
@@ -883,7 +888,7 @@ def process_replay(item: dict) -> None:
                                    previous["status"] if previous else None)
             return
         added_samples = 0
-        with db() as connection:
+        with db_write_guard, db() as connection:
             team_summary = json.dumps(team_br_summary(real_players, mode, match_br))
             teammate_countries = squad_countries(real_players)
             for player in real_players:
@@ -945,6 +950,10 @@ def process_replay(item: dict) -> None:
             record_error(sid, item, NO_PLAYERS, pending=True)
         else:
             record_error(sid, item, str(error.detail))
+    except sqlite3.OperationalError as error:
+        if database_is_locked(error):
+            raise  # The page worker retries this session; it is not a bad replay.
+        record_error(sid, item, f"OperationalError: {error}")
     except Exception as error:
         record_error(sid, item, f"{type(error).__name__}: {error}")
     finally:
@@ -962,19 +971,31 @@ def process_page(items: list[dict]) -> None:
     concurrency = setting("concurrency", 2)
     iterator = iter(candidates)
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = set()
+        futures = {}
+        def submit(item: dict) -> None:
+            futures[pool.submit(process_replay, item)] = item
         for _ in range(concurrency):
             item = next(iterator, None)
             if item is not None and not stop_event.is_set():
-                futures.add(pool.submit(process_replay, item))
+                submit(item)
         while futures:
-            finished, futures = wait(futures, return_when=FIRST_COMPLETED)
+            finished, _ = wait(futures, return_when=FIRST_COMPLETED)
             for future in finished:
-                future.result()
+                item = futures.pop(future)
+                try:
+                    future.result()
+                except sqlite3.OperationalError as error:
+                    if not database_is_locked(error):
+                        raise
+                    with guard:
+                        runtime["phase"] = "数据库暂时被占用，等待 5 秒后重试本局"
+                    if not stop_event.wait(5):
+                        submit(item)
+                    continue
                 if not stop_event.is_set():
                     item = next(iterator, None)
                     if item is not None:
-                        futures.add(pool.submit(process_replay, item))
+                        submit(item)
 
 
 def retry_pending() -> None:
@@ -1087,55 +1108,16 @@ def repair_old_missing_lineups() -> None:
 
 def scan_loop() -> None:
     try:
-        if stop_event.is_set():
-            return
-        # Check the authenticated listing before any potentially slow backlog work.
-        with guard:
-            runtime["phase"] = "正在验证官网登录"
-        latest_listing = fetch_page(1)
-        pages_since_head = 20 if setting("page", 1) > 1 else 0
         while not stop_event.is_set():
-            # Give settled replays a bounded, concurrent retry batch before new pages.
-            with guard:
-                runtime["phase"] = "正在补试待结算战局"
-            retry_pending()
-            if stop_event.is_set():
+            try:
+                scan_pages()
                 break
-            with guard:
-                runtime["phase"] = "正在检查旧战局"
-            repair_old_missing_lineups()
-            if stop_event.is_set():
-                break
-            page = setting("page", 1)
-            if page > 1 and pages_since_head >= 20:
+            except sqlite3.OperationalError as error:
+                if not database_is_locked(error):
+                    raise
                 with guard:
-                    runtime["phase"] = "正在处理最新战局"
-                listing = latest_listing if latest_listing is not None else fetch_page(1)
-                latest_listing = None
-                process_page(listing["items"])
-                pages_since_head = 0
-                if stop_event.is_set():
-                    break
-            with guard:
-                runtime["phase"] = f"正在读取官网第 {page} 页"
-            listing = latest_listing if page == 1 and latest_listing is not None else fetch_page(page)
-            latest_listing = None
-            with guard:
-                runtime["page"] = page
-            if not listing["items"]:
-                save_setting("page", 1)
-                with guard:
-                    runtime["phase"] = "官网当前无新战局，30 秒后重试"
-                stop_event.wait(30)
-                continue
-            with guard:
-                runtime["phase"] = f"正在处理第 {page} 页"
-            process_page(listing["items"])
-            if stop_event.is_set():
-                break
-            save_setting("page", page + 1)
-            pages_since_head += 1
-            stop_event.wait(0.2)
+                    runtime["phase"] = "数据库暂时被占用，等待 5 秒后继续扫描"
+                stop_event.wait(5)
     except HTTPException as error:
         with guard:
             runtime["last_error"] = f"官网列表：{error.detail}"
@@ -1148,6 +1130,58 @@ def scan_loop() -> None:
             runtime["running"] = False
             runtime["stopping"] = False
             runtime["phase"] = None
+
+
+def scan_pages() -> None:
+    if stop_event.is_set():
+        return
+    # Check the authenticated listing before any potentially slow backlog work.
+    with guard:
+        runtime["phase"] = "正在验证官网登录"
+    latest_listing = fetch_page(1)
+    pages_since_head = 20 if setting("page", 1) > 1 else 0
+    while not stop_event.is_set():
+        # Give settled replays a bounded, concurrent retry batch before new pages.
+        with guard:
+            runtime["phase"] = "正在补试待结算战局"
+        retry_pending()
+        if stop_event.is_set():
+            break
+        with guard:
+            runtime["phase"] = "正在检查旧战局"
+        repair_old_missing_lineups()
+        if stop_event.is_set():
+            break
+        page = setting("page", 1)
+        if page > 1 and pages_since_head >= 20:
+            with guard:
+                runtime["phase"] = "正在处理最新战局"
+            listing = latest_listing if latest_listing is not None else fetch_page(1)
+            latest_listing = None
+            process_page(listing["items"])
+            pages_since_head = 0
+            if stop_event.is_set():
+                break
+        with guard:
+            runtime["phase"] = f"正在读取官网第 {page} 页"
+        listing = latest_listing if page == 1 and latest_listing is not None else fetch_page(page)
+        latest_listing = None
+        with guard:
+            runtime["page"] = page
+        if not listing["items"]:
+            save_setting("page", 1)
+            with guard:
+                runtime["phase"] = "官网当前无新战局，30 秒后重试"
+            stop_event.wait(30)
+            continue
+        with guard:
+            runtime["phase"] = f"正在处理第 {page} 页"
+        process_page(listing["items"])
+        if stop_event.is_set():
+            break
+        save_setting("page", page + 1)
+        pages_since_head += 1
+        stop_event.wait(0.2)
 
 
 def status_data() -> dict:

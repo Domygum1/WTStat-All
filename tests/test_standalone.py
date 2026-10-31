@@ -161,6 +161,21 @@ with patch.object(server, "fetch_page", return_value={"items": [{}]}) as fetch, 
     server.scan_loop()
     fetch.assert_called_once_with(1)
 server.stop_event.clear()
+with patch.object(server, "scan_pages", side_effect=[
+        sqlite3.OperationalError("database is locked"), None]) as pages, \
+     patch.object(server.stop_event, "wait", return_value=False) as pause:
+    server.runtime["running"] = True
+    server.scan_loop()
+    assert pages.call_count == 2
+    pause.assert_called_once_with(5)
+    assert server.runtime["running"] is False
+server.runtime["phase"] = None
+with patch.object(server, "process_replay", side_effect=[
+        sqlite3.OperationalError("database is locked"), None]) as process, \
+     patch.object(server.stop_event, "wait", return_value=False):
+    server.process_page([{"statisticGroup": "aircraft", "gameMode": "realistic"}])
+    assert process.call_count == 2
+server.runtime["phase"] = None
 assert server.is_real_player("123", "notrobot_1")
 assert not server.is_real_player("-12", "player")
 assert not server.is_real_player("0", "player")
