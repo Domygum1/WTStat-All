@@ -78,6 +78,10 @@ assert match_br == 2.7
 assert server.index().path.is_file()
 assert server.wt_symbols_font().path.is_file()
 assert server.status()["cookie_configured"] is False
+assert server.status()["interval_rule"] == "bounded-1.0-v1"
+page = server.index().path.read_text(encoding="utf-8")
+assert "后端仍在运行旧版" in page
+assert "不预设区间宽度为 1.0" not in page
 assert server.status()["auto_login_configured"] is False
 with patch.object(gaijin_login, "configured", return_value=True), \
      patch.object(server.threading, "Thread") as worker:

@@ -47,6 +47,7 @@ def rating_ceilings() -> dict[str, int]:
 
 
 BR_CEILINGS = rating_ceilings()
+MATCH_INTERVAL_RULE = "bounded-1.0-v1"
 DB = ROOT / "data" / "wtstat_all.sqlite3"
 BATTLE_DB = ROOT / "data" / "battles.sqlite3"
 CACHE = ROOT / "cache" / "replays"
@@ -1232,6 +1233,7 @@ def scan_pages() -> None:
 def status_data() -> dict:
     with guard:
         snapshot = dict(runtime)
+    snapshot["interval_rule"] = MATCH_INTERVAL_RULE
     snapshot["br_ceilings"] = {mode: tick / 10 for mode, tick in BR_CEILINGS.items()}
     snapshot["concurrency"] = setting("concurrency", 2)
     snapshot["keep_files"] = setting("keep_files", 100)
