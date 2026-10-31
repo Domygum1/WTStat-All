@@ -520,6 +520,19 @@ with patch.object(server, "download_last_part", return_value=Path("ignored.wrpl"
     server.process_replay({**bot_only_item, "sessionIdHex": new_sid})
     short_sid = "be95b0800065709"
     server.process_replay({**bot_only_item, "sessionIdHex": short_sid})
+limit_sid = "abababababababe1"
+with patch.object(server, "download_last_part",
+                  side_effect=server.HTTPException(429, "rate limited")):
+    server.process_replay({**bot_only_item, "sessionIdHex": limit_sid})
+assert server.stop_event.is_set()
+assert "429" in server.runtime["last_error"]
+with patch.object(server, "download_last_part", return_value=Path("ignored.wrpl")), \
+     patch.object(server, "parse_with_lineup_fallback", return_value={"players": [human, other_human]}):
+    server.process_replay({**bot_only_item, "sessionIdHex": "abababababababe2"})
+assert "429" in server.runtime["last_error"]  # Another worker must not hide the stop reason.
+server.record_error("abababababababe3", bot_only_item, "another replay failed")
+assert "429" in server.runtime["last_error"]
+server.stop_event.clear()
 assert server.valid_sid(short_sid)
 assert not server.valid_sid(short_sid + "00")
 response = Mock(status_code=200, headers={"Content-Length": "1235"})

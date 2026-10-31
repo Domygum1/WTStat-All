@@ -94,6 +94,14 @@ def database_is_locked(error: sqlite3.OperationalError) -> bool:
     return "locked" in str(error).lower() or "busy" in str(error).lower()
 
 
+def stop_for_rate_limit() -> None:
+    """Keep the fatal reason visible while in-flight downloads finish."""
+    with guard:
+        stop_event.set()
+        runtime["last_error"] = ("Gaijin 返回 429（请求过于频繁），采集已停止；"
+                                 "请稍后重试，必要时调低“同时下载”。")
+
+
 def setting(key: str, default: int) -> int:
     with db() as connection:
         row = connection.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -813,7 +821,7 @@ def record_error(sid: str, item: dict, error: str, *, pending: bool = False) -> 
             runtime["pending"] += 1
         elif new_status == "error" and old_status == "pending":
             runtime["pending"] = max(0, runtime["pending"] - 1)
-        if not pending:
+        if not pending and not stop_event.is_set():
             runtime["last_error"] = f"{sid}: {error}"
 
 
@@ -978,12 +986,11 @@ def process_replay(item: dict) -> None:
             runtime["processed"] += 1
             runtime["samples"] += added_samples
             runtime["revision"] += 1
-            runtime["last_error"] = None
+            if not stop_event.is_set():
+                runtime["last_error"] = None
     except HTTPException as error:
         if error.status_code == 429:
-            with guard:
-                runtime["last_error"] = "Gaijin 返回 429，采集已停止；请稍后再开启。"
-            stop_event.set()
+            stop_for_rate_limit()
         elif error.status_code == 404:
             record_error(sid, item, "结算段暂不可用 (HTTP 404)，稍后重试", pending=True)
         elif error.detail == NO_PLAYERS:
@@ -1129,9 +1136,7 @@ def repair_old_missing_lineups() -> None:
             changed = True
         except HTTPException as error:
             if error.status_code == 429:
-                with guard:
-                    runtime["last_error"] = "Gaijin 返回 429，采集已停止；请稍后再开启。"
-                stop_event.set()
+                stop_for_rate_limit()
                 break
             with db() as connection:
                 connection.execute(
