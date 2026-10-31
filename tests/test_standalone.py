@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RESOURCES = (
     "server.py",
     "replay_core.py",
+    "gaijin_login.py",
     "static/index.html",
     "static/fonts/symbols_skyquake.bfc9728c6a6bc73f209a.ttf",
     "data/wiki_vehicles.csv",
@@ -34,6 +35,7 @@ class StandaloneTest(unittest.TestCase):
             self.assertFalse((isolated.parent / "WTStat").exists())
             script = """
 import replay_core
+import gaijin_login
 import server
 import csv
 import json
@@ -71,6 +73,15 @@ assert match_br == 2.7
 assert server.index().path.is_file()
 assert server.wt_symbols_font().path.is_file()
 assert server.status()["cookie_configured"] is False
+assert server.status()["auto_login_configured"] is False
+with patch.object(gaijin_login, "configured", return_value=True), \
+     patch.object(server.threading, "Thread") as worker:
+    assert server.control(server.Control(running=True))["running"] is True
+    worker.return_value.start.assert_called_once_with()
+server.worker_thread = None
+server.runtime["running"] = False
+server.runtime["phase"] = None
+server.stop_event.clear()
 server.update_settings(server.Settings(concurrency=2, keep_files=100,
                                        capture_mode="air"))
 server.update_settings(server.Settings(concurrency=2, keep_files=100,
@@ -97,6 +108,40 @@ with patch.object(server.wt, "request", return_value=UnauthorizedListing()):
         assert error.status_code == 401 and "HTTP 403" in error.detail
     else:
         raise AssertionError("An unauthorized replay listing must report a cookie error")
+class ValidListing(EmptyListing):
+    def json(self): return {"items": [{}], "total_count": 1}
+with patch.object(gaijin_login, "configured", return_value=True), \
+     patch.object(gaijin_login, "refresh_cookie", return_value="new") as login, \
+     patch.object(replay_core.requests, "request", return_value=ValidListing()) as official:
+    replay_core.request("https://warthunder.com/en/api/replay", auth=True)
+    login.assert_called_once_with(force=False)
+    assert official.call_args.kwargs["cookies"] == {"identity_sid": "new"}
+with patch.object(gaijin_login, "configured", return_value=True), \
+     patch.object(server.wt, "request", side_effect=[UnauthorizedListing(), ValidListing()]) as official, \
+     patch.object(server.wt, "refresh_site_login", return_value="fresh") as login:
+    assert server.fetch_page(1)["total_count"] == 1
+    assert official.call_count == 2
+    login.assert_called_once_with(force=True)
+import builtins
+real_import = builtins.__import__
+def missing_playwright(name, *args, **kwargs):
+    if name == "playwright.sync_api":
+        raise ImportError("test")
+    return real_import(name, *args, **kwargs)
+with patch.object(gaijin_login, "_credentials", return_value=("test", "test")), \
+     patch.object(gaijin_login.time, "monotonic", return_value=1000), \
+     patch("builtins.__import__", side_effect=missing_playwright):
+    for force in (False, True):
+        try:
+            gaijin_login.refresh_cookie(force=force)
+        except gaijin_login.LoginError as error:
+            assert "Playwright" in str(error)
+    try:
+        gaijin_login.refresh_cookie(force=True)
+    except gaijin_login.LoginError as error:
+        assert "10 分钟" in str(error)
+    else:
+        raise AssertionError("Repeated forced login must be throttled")
 with patch.object(server, "retry_pending") as retry, \
      patch.object(server, "repair_old_missing_lineups"), \
      patch.object(server, "fetch_page", side_effect=server.HTTPException(401, "Cookie expired")):

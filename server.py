@@ -24,6 +24,7 @@ from starlette.background import BackgroundTask
 
 ROOT = Path(__file__).resolve().parent
 import replay_core as wt
+import gaijin_login
 
 if not wt.wiki_catalog():
     raise RuntimeError("缺少本目录 data/wiki_vehicles.csv 或载具表无效。")
@@ -578,26 +579,34 @@ def fetch_page(page: int) -> dict:
                "findMissionValue": "", "findUserValue": "", "findUserType": "USERNAME",
                "isUserOwnReplays": False, "rankRange": "", "timeRangeFrom": "",
                "timeRangeTo": "", "limit": PAGE_SIZE, "page": page}
-    response = wt.request("https://warthunder.com/en/api/replay", auth=True,
-                          method="POST", payload=payload)
-    try:
-        if response.status_code in (401, 403):
-            raise HTTPException(401, "identity_sid 登录状态可能已失效（官网返回 "
-                                f"HTTP {response.status_code}）；请重新登录官网并更新 config.local.json。")
-        if response.status_code != 200:
-            raise HTTPException(response.status_code, f"官网对局列表 HTTP {response.status_code}")
-        if "json" not in response.headers.get("Content-Type", ""):
-            raise HTTPException(401, "官网未返回 Replay 数据；identity_sid 可能已失效。"
-                                "请重新登录官网并更新 config.local.json。")
-        result = response.json()
-        if not isinstance(result.get("items"), list) or not isinstance(result.get("total_count"), int):
-            raise HTTPException(502, "官网对局列表格式已变化。")
-        if result["total_count"] == 0:
-            raise HTTPException(401, "官网无筛选回放列表返回 0 场；identity_sid 可能已失效或官网暂时异常。"
-                                "请重新登录官网并更新 config.local.json。")
-        return result
-    finally:
-        response.close()
+    for attempt in range(2):
+        response = wt.request("https://warthunder.com/en/api/replay", auth=True,
+                              method="POST", payload=payload)
+        try:
+            if response.status_code in (401, 403):
+                login_error = ("identity_sid 登录状态可能已失效（官网返回 "
+                               f"HTTP {response.status_code}）；请重新登录官网并更新 config.local.json。")
+            elif response.status_code != 200:
+                raise HTTPException(response.status_code,
+                                    f"官网对局列表 HTTP {response.status_code}")
+            elif "json" not in response.headers.get("Content-Type", ""):
+                login_error = ("官网未返回 Replay 数据；identity_sid 可能已失效。"
+                               "请重新登录官网并更新 config.local.json。")
+            else:
+                result = response.json()
+                if not isinstance(result.get("items"), list) or not isinstance(result.get("total_count"), int):
+                    raise HTTPException(502, "官网对局列表格式已变化。")
+                if result["total_count"]:
+                    return result
+                login_error = ("官网无筛选回放列表返回 0 场；identity_sid 可能已失效或官网暂时异常。"
+                               "请重新登录官网并更新 config.local.json。")
+        finally:
+            response.close()
+        if attempt == 0 and gaijin_login.configured():
+            wt.refresh_site_login(force=True)
+        else:
+            raise HTTPException(401, login_error)
+    raise HTTPException(401, "网站登录仍未生效。请运行 python gaijin_login.py 完成人工验证。")
 
 
 def download_last_part(sid: str, part: int) -> Path:
@@ -1150,6 +1159,7 @@ def status_data() -> dict:
     snapshot["capture_mode"] = capture_mode_setting()
     snapshot["saved_files"] = sum(1 for _ in CACHE.glob("*/*.wrpl"))
     snapshot["cookie_configured"] = bool(wt.cookie())
+    snapshot["auto_login_configured"] = gaijin_login.configured()
     return snapshot
 
 
@@ -1188,8 +1198,8 @@ def control(payload: Control):
     global worker_thread
     with guard:
         if payload.running:
-            if not wt.cookie():
-                raise HTTPException(401, "需要 identity_sid；请配置本目录的 config.local.json。")
+            if not wt.cookie() and not gaijin_login.configured():
+                raise HTTPException(401, "需要 identity_sid；请配置 config.local.json 或自动登录。")
             if worker_thread and worker_thread.is_alive():
                 if runtime["stopping"]:
                     raise HTTPException(409, "正在停止当前任务，请稍后重新启动。")

@@ -59,11 +59,22 @@ def cookie() -> str | None:
         return None
 
 
+def refresh_site_login(*, force: bool = False) -> str:
+    from gaijin_login import LoginError, configured, refresh_cookie
+    if not configured():
+        raise HTTPException(401, "官网采集需要 identity_sid。请配置 config.local.json，或按 README 配置自动登录。")
+    try:
+        return refresh_cookie(force=force)
+    except LoginError as error:
+        raise HTTPException(401, str(error)) from error
+
+
 def request(url, *, auth=False, stream=False, method="GET", payload=None, headers=None):
     global LAST_REQUEST
-    jar = {"identity_sid": cookie()} if auth and cookie() else None
-    if auth and not jar:
-        raise HTTPException(401, "官网搜索需要 identity_sid。请按 README 创建 config.local.json。")
+    site_cookie = cookie() if auth else None
+    if auth and not site_cookie:
+        site_cookie = refresh_site_login()
+    jar = {"identity_sid": site_cookie} if site_cookie else None
     with LOCK:
         delay = 0.5 - (time.monotonic() - LAST_REQUEST)
         if delay > 0:

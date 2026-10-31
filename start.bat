@@ -1,5 +1,7 @@
 @echo off
 setlocal
+chcp 65001 >nul
+set "PYTHONIOENCODING=utf-8"
 cd /d "%~dp0"
 title WTStat ALL - Replay Sampler - Port 8767
 set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
@@ -7,7 +9,7 @@ if not exist "%PYTHON_EXE%" (
   python -m venv .venv
   if errorlevel 1 goto :fail
 )
-"%PYTHON_EXE%" -c "import fastapi,uvicorn,requests" >nul 2>nul
+"%PYTHON_EXE%" -c "import fastapi,uvicorn,requests,playwright" >nul 2>nul
 if errorlevel 1 (
   "%PYTHON_EXE%" -m pip install -r requirements.txt
   if errorlevel 1 goto :fail
