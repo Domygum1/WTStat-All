@@ -225,6 +225,19 @@ def rating_tick(value, mode: str) -> int | None:
     return tick
 
 
+def bounded_match_min(mode: str, match_br: float | None,
+                      squad_brs) -> float | None:
+    """Find the lowest known squad BR within 1.0 of the match maximum."""
+    high = rating_tick(match_br, mode)
+    if high is None:
+        return None
+    floor = max(10, high - 10)
+    candidates = [tick for value in squad_brs
+                  if (tick := rating_tick(value, mode)) is not None
+                  and floor <= tick <= high]
+    return min(candidates, default=floor) / 10
+
+
 def is_real_player(uid: object, name: object) -> bool:
     uid = str(uid)
     return (uid.isascii() and uid.isdecimal() and int(uid) > 0
@@ -391,13 +404,15 @@ BATTLE_COLUMNS = ("sid", "start_utc", "map", "mode", "player_count", "last_part"
 def battle_values(sid: str, start: str | None, replay_map: str | None, mode: str,
                   player_count: int | None, last_part: int | None,
                   processed_at: float | None, match_br: float | None,
-                  team_br_json: str | None) -> tuple:
-    teams, interval = decoded_team_br(team_br_json)
+                  team_br_json: str | None, squad_brs=None) -> tuple:
+    teams, _ = decoded_team_br(team_br_json)
     sides = [teams.get(str(team)) for team in (1, 2)]
     def field(side, key):
         return side.get(key) if isinstance(side, dict) else None
+    if squad_brs is None:
+        squad_brs = (field(side, "min") for side in sides)
     return (sid, start, replay_map, mode, player_count, last_part, processed_at,
-            interval[0] if interval and match_br is not None else None, match_br,
+            bounded_match_min(mode, match_br, squad_brs), match_br,
             *(field(side, key) for side in sides
               for key in ("min", "max", "average_squad_br")))
 
@@ -492,7 +507,7 @@ def repair_missing_battle_ratings() -> dict[str, int]:
                     }
             fill_bot_team_br(teams, {row["team"] for row in rated_rows}, match_br, mode)
             sides = [teams[str(team)] for team in (1, 2)]
-            lower = min((side["min"] for side in sides if side is not None), default=None)
+            lower = bounded_match_min(mode, match_br, squad_brs)
             connection.execute(
                 "UPDATE battle.matches SET match_br_min=?,match_br_max=?,"
                 "team1_br_min=?,team1_br_max=?,team1_average_squad_br=?,"
@@ -562,6 +577,30 @@ def fill_saved_bot_team_brs() -> int:
 
 
 fill_saved_bot_team_brs()
+
+
+def refresh_saved_match_intervals(*, once: bool = False) -> None:
+    """Rebuild stored match minima from saved squads without changing player BRs."""
+    with db() as connection:
+        if once and connection.execute(
+                "SELECT 1 FROM settings WHERE key='bounded_match_intervals_v1'").fetchone():
+            return
+        connection.execute(
+            "UPDATE battle.matches AS b SET match_br_min=ROUND(COALESCE(("
+            "SELECT MIN(s.squad_br) FROM samples s WHERE s.sid=b.sid "
+            "AND s.squad_br BETWEEN MAX(1.0,b.match_br_max-1.0)-0.0001 "
+            "AND b.match_br_max+0.0001 "
+            "AND ABS(s.squad_br*10-ROUND(s.squad_br*10))<0.001 "
+            "AND CAST(ROUND(s.squad_br*10) AS INTEGER)%10 IN (0,3,7)"
+            "),MAX(1.0,b.match_br_max-1.0)),1) "
+            "WHERE b.match_br_max IS NOT NULL AND b.mode IN ('air','ground')")
+        if once:
+            connection.execute(
+                "INSERT OR REPLACE INTO settings VALUES('bounded_match_intervals_v1','1')")
+    runtime["revision"] += 1
+
+
+refresh_saved_match_intervals(once=True)
 
 
 def battle_api_row(row: sqlite3.Row) -> dict:
@@ -929,7 +968,8 @@ def process_replay(item: dict) -> None:
                  BR_CEILINGS[mode]))
             save_battle(connection, battle_values(
                 sid, replay_start, item.get("missionName"), mode, len(data["players"]),
-                last_part, processed_at, match_br, team_summary))
+                last_part, processed_at, match_br, team_summary,
+                (player.get("squad_br") for player in real_players)))
         with guard:
             if previous and previous["status"] == "error":
                 runtime["errors"] = max(0, runtime["errors"] - 1)
@@ -1053,9 +1093,9 @@ def repair_old_missing_lineups() -> None:
             values = battle_values(
                 sid, row["start_utc"], row["map"], row["group_name"],
                 row["player_count"], last_part, row["processed_at"],
-                match_br, summary)
+                match_br, summary, (player.get("squad_br") for player in players))
             if values[7] is None or match_br is None:
-                # The saved result still lacks enough data for a reliable lower bound.
+                # The saved result still lacks a usable match maximum.
                 with db() as connection:
                     connection.execute(
                         "INSERT OR REPLACE INTO lineup_repair_attempts "
@@ -1424,18 +1464,29 @@ def party_distribution(mode: str, composition_filter: tuple[str, ...] | None,
     with db() as connection:
         minima = {}
         for row in connection.execute(
-            "SELECT s.sid, MIN(s.squad_br) AS minimum, COUNT(*) AS retained, "
-            "COUNT(s.squad_br) AS known, MAX(r.br_ceiling_tick) AS ceiling "
-            "FROM samples s LEFT JOIN replays r ON r.sid=s.sid WHERE s.mode=?" +
+            "SELECT s.sid, MIN(CASE WHEN s.squad_br BETWEEN "
+            "MAX(1.0,COALESCE(r.match_br,s.match_br)-1.0)-0.0001 "
+            "AND COALESCE(r.match_br,s.match_br)+0.0001 "
+            "AND ABS(s.squad_br*10-ROUND(s.squad_br*10))<0.001 "
+            "AND CAST(ROUND(s.squad_br*10) AS INTEGER)%10 IN (0,3,7) "
+            "THEN s.squad_br END) AS minimum, "
+            "MAX(COALESCE(r.match_br,s.match_br)) AS maximum, "
+            "MAX(r.br_ceiling_tick) AS ceiling "
+            "FROM samples s LEFT JOIN replays r ON r.sid=s.sid "
+            "WHERE s.mode=?" +
             time_clause + " GROUP BY s.sid", (mode, *time_params)
         ):
+            high = rating_tick(row["maximum"], mode)
             minima[row["sid"]] = (
-                rating_tick(row["minimum"], mode)
-                if row["retained"] == row["known"] else None,
+                rating_tick(row["minimum"], mode) or max(10, high - 10)
+                if high is not None else None,
                 row["ceiling"] or BR_CEILINGS[mode])
         rows = connection.execute(
-            "SELECT s.sid,s.country,s.squad_br,s.match_br,s.squad_countries,s.party_key "
-            "FROM samples s WHERE s.mode=?" + time_clause, (mode, *time_params))
+            "SELECT s.sid,s.country,s.squad_br,"
+            "COALESCE(r.match_br,s.match_br) AS match_br,"
+            "s.squad_countries,s.party_key "
+            "FROM samples s LEFT JOIN replays r ON r.sid=s.sid "
+            "WHERE s.mode=?" + time_clause, (mode, *time_params))
         for row in rows:
             if row["squad_countries"] is None:
                 continue
@@ -1467,6 +1518,8 @@ def party_distribution(mode: str, composition_filter: tuple[str, ...] | None,
     def add(sid: str, signature: tuple, count: int) -> None:
         composition, squad_tick, match_tick = signature
         if squad_tick is None or match_tick is None:
+            return
+        if not max(10, match_tick - 10) <= squad_tick <= match_tick:
             return
         if party_size is not None and len(composition) != party_size:
             return
@@ -2021,6 +2074,8 @@ def import_csv_file(path: Path) -> dict:
             raise HTTPException(422, "CSV 必须使用 UTF-8 编码。") from None
         except csv.Error:
             raise HTTPException(422, "CSV 文件格式无效。") from None
+        if imported_samples:
+            refresh_saved_match_intervals()
         with db() as connection:
             runtime["processed"] = connection.execute("SELECT COUNT(*) FROM replays WHERE status='done'").fetchone()[0]
             runtime["errors"] = connection.execute("SELECT COUNT(*) FROM replays WHERE status='error'").fetchone()[0]
@@ -2117,6 +2172,8 @@ def import_battles_file(path: Path) -> dict:
                          data["processed_at"] if data["processed_at"] is not None else time.time()))
         except (UnicodeError, csv.Error):
             raise HTTPException(422, "CSV 文件格式或编码无效。") from None
+        if added:
+            refresh_saved_match_intervals()
         with db() as connection:
             runtime["processed"] = connection.execute("SELECT COUNT(*) FROM replays WHERE status='done'").fetchone()[0]
             runtime["errors"] = connection.execute("SELECT COUNT(*) FROM replays WHERE status='error'").fetchone()[0]

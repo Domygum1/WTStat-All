@@ -53,6 +53,11 @@ assert server.rating_tick(14.0, "ground") == 140
 assert server.possible_ticks("air")[-1] == 150
 assert server.possible_ticks("ground")[-1] == 140
 assert server.rate_bucket("air", 140, 150, 130) == "big_underdog"
+assert server.bounded_match_min("air", 14.0, [12.0, 13.3, 14.0]) == 13.3
+assert server.bounded_match_min("air", 14.0, [12.0, 13.0, 14.0]) == 13.0
+assert server.bounded_match_min("air", 14.3, [13.0, 13.7, 14.3]) == 13.7
+assert server.bounded_match_min("air", 14.0, []) == 13.0
+assert server.bounded_match_min("air", None, [13.0]) is None
 assert server.rate_bucket("air", 143, 150, 140) == "small_underdog"
 assert server.rate_bucket("ground", 133, 140, 130) == "small_underdog"
 assert server.rate_bucket("air", 140, 147, 137, 147) == "small_underdog"
@@ -324,8 +329,35 @@ with server.db() as connection:
          ("cccccccccccccccc", "202", "air", 2.7, 2.7, "solo:202"),
          ("cccccccccccccccc", "203", "air", None, 2.7, "solo:203")])
 _, _, ranges, ceilings = server.party_distribution("air", None, None)
-assert ranges[27][(27, 27)] == 1  # A removed Bot does not hide the known lower bound.
-assert ranges[27][(None, 27)] == 1  # A retained player with no BR still does.
+assert ranges[27][(27, 27)] == 2  # An unknown BR does not erase a known lower bound.
+
+bounded_sid = "9999999999999999"
+with server.db() as connection:
+    connection.execute("INSERT INTO battle.matches(sid,mode,match_br_min,match_br_max) "
+                       "VALUES(?,'air',12.0,14.0)", (bounded_sid,))
+    connection.execute("INSERT INTO replays(sid,mode,status,processed_at,match_br) "
+                       "VALUES(?,'air','done',0,14.0)", (bounded_sid,))
+    connection.executemany(
+        "INSERT INTO samples(sid,uid,mode,squad_br,match_br,squad_countries,party_key) "
+        "VALUES(?,?,'air',?,14.0,'[]',?)",
+        [(bounded_sid, uid, br, 'solo:'+uid)
+         for uid,br in [('901','12.0'),('902','13.3'),('903','14.0')]])
+server.refresh_saved_match_intervals()
+with server.db() as connection:
+    assert connection.execute("SELECT match_br_min FROM battle.matches WHERE sid=?",
+                              (bounded_sid,)).fetchone()[0] == 13.3
+_, _, ranges, _ = server.party_distribution("air", None, None)
+assert ranges[133][(133, 140)] == 1
+assert ranges[120][(133, 140)] == 0  # Out-of-band player is ignored in analytics.
+with server.db() as connection:
+    connection.execute("INSERT INTO samples(sid,uid,mode,squad_br,match_br,squad_countries,party_key) "
+                       "VALUES(?,'904','air',13.0,14.0,'[]','solo:904')", (bounded_sid,))
+server.refresh_saved_match_intervals()
+with server.db() as connection:
+    assert connection.execute("SELECT match_br_min FROM battle.matches WHERE sid=?",
+                              (bounded_sid,)).fetchone()[0] == 13.0
+assert server.battle_values(bounded_sid, None, None, 'air', 4, 0, 0, 14.0, None,
+                            [12.0, 13.0, 13.3, 14.0])[7:9] == (13.0, 14.0)
 
 with server.db() as connection:
     connection.execute("INSERT INTO battle.matches(sid,mode) VALUES('dddddddddddddddd','air')")
