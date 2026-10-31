@@ -1471,23 +1471,24 @@ def party_distribution(mode: str, composition_filter: tuple[str, ...] | None,
     with db() as connection:
         minima = {}
         for row in connection.execute(
-            "SELECT s.sid, MIN(CASE WHEN s.squad_br BETWEEN "
+            "SELECT s.sid, COALESCE(r.match_br,s.match_br) AS maximum, "
+            "MIN(CASE WHEN s.squad_br BETWEEN "
             "MAX(1.0,COALESCE(r.match_br,s.match_br)-1.0)-0.0001 "
             "AND COALESCE(r.match_br,s.match_br)+0.0001 "
             "AND ABS(s.squad_br*10-ROUND(s.squad_br*10))<0.001 "
             "AND CAST(ROUND(s.squad_br*10) AS INTEGER)%10 IN (0,3,7) "
             "THEN s.squad_br END) AS minimum, "
-            "MAX(COALESCE(r.match_br,s.match_br)) AS maximum, "
             "MAX(r.br_ceiling_tick) AS ceiling "
             "FROM samples s LEFT JOIN replays r ON r.sid=s.sid "
             "WHERE s.mode=?" +
-            time_clause + " GROUP BY s.sid", (mode, *time_params)
+            time_clause + " GROUP BY s.sid,COALESCE(r.match_br,s.match_br)",
+            (mode, *time_params)
         ):
             high = rating_tick(row["maximum"], mode)
-            minima[row["sid"]] = (
-                rating_tick(row["minimum"], mode) or max(10, high - 10)
-                if high is not None else None,
-                row["ceiling"] or BR_CEILINGS[mode])
+            if high is not None:
+                minima[(row["sid"], high)] = (
+                    rating_tick(row["minimum"], mode) or max(10, high - 10),
+                    row["ceiling"] or BR_CEILINGS[mode])
         rows = connection.execute(
             "SELECT s.sid,s.country,s.squad_br,"
             "COALESCE(r.match_br,s.match_br) AS match_br,"
@@ -1533,7 +1534,10 @@ def party_distribution(mode: str, composition_filter: tuple[str, ...] | None,
         if composition_filter is not None and composition != composition_filter:
             return
         grouped[squad_tick][match_tick] += count
-        minimum_tick, ceiling_tick = minima.get(sid, (None, BR_CEILINGS[mode]))
+        minimum_tick, ceiling_tick = minima.get(
+            (sid, match_tick), (max(10, match_tick - 10), BR_CEILINGS[mode]))
+        if minimum_tick is None or not max(10, match_tick - 10) <= minimum_tick <= match_tick:
+            minimum_tick = max(10, match_tick - 10)
         ranges[squad_tick][(minimum_tick, match_tick)] += count
         ceiling_usage[squad_tick][ceiling_tick] += count
         bucket = rate_bucket(mode, squad_tick, match_tick, minimum_tick, ceiling_tick)

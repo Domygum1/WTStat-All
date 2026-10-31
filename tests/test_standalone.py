@@ -363,6 +363,19 @@ with server.db() as connection:
 assert server.battle_values(bounded_sid, None, None, 'air', 4, 0, 0, 14.0, None,
                             [12.0, 13.0, 13.3, 14.0])[7:9] == (13.0, 14.0)
 
+mixed_match_sid = "8989898989898989"
+with server.db() as connection:
+    connection.execute("INSERT INTO replays(sid,mode,status,processed_at) "
+                       "VALUES(?,'ground','done',0)", (mixed_match_sid,))
+    connection.executemany(
+        "INSERT INTO samples(sid,uid,mode,squad_br,match_br,squad_countries,party_key) "
+        "VALUES(?,?,'ground',?,?, '[]',?)",
+        [(mixed_match_sid, '911', 14.0, 14.0, 'solo:911'),
+         (mixed_match_sid, '912', 14.0, 14.3, 'solo:912')])
+_, _, ground_ranges, _ = server.party_distribution('ground', None, None)
+assert ground_ranges[140][(140, 140)] == 1
+assert not any(low is None for ranges in ground_ranges.values() for low, _ in ranges)
+
 with server.db() as connection:
     connection.execute("INSERT INTO battle.matches(sid,mode) VALUES('dddddddddddddddd','air')")
     connection.execute("INSERT INTO replays(sid,mode,group_name,status,processed_at) "
