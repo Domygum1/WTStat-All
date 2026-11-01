@@ -158,10 +158,12 @@ with patch.object(server, "retry_pending") as retry, \
     server.scan_loop()
     retry.assert_not_called()
 assert server.status()["cookie_expired"] and "Cookie expired" in server.status()["last_error"]
+assert server.status()["stop_reason"] == "cookie"
 assert not server.status()["running"]
 assert server.status()["phase"] is None
 server.runtime["cookie_expired"] = False
 server.runtime["last_error"] = None
+server.runtime["stop_reason"] = None
 with patch.object(server, "fetch_page", return_value={"items": [{}]}) as fetch, \
      patch.object(server, "retry_pending"), \
      patch.object(server, "repair_old_missing_lineups"), \
@@ -170,22 +172,51 @@ with patch.object(server, "fetch_page", return_value={"items": [{}]}) as fetch, 
     server.scan_loop()
     fetch.assert_called_once_with(1)
 server.stop_event.clear()
-with patch.object(server, "scan_pages", side_effect=[
-        sqlite3.OperationalError("database is locked"), None]) as pages, \
+server.runtime["stop_reason"] = None
+locked_calls = []
+def locked_then_stop():
+    locked_calls.append(1)
+    if len(locked_calls) == 1:
+        raise sqlite3.OperationalError("database is locked")
+    server.stop_event.set()
+with patch.object(server, "scan_pages", side_effect=locked_then_stop) as pages, \
      patch.object(server.stop_event, "wait", return_value=False) as pause:
     server.runtime["running"] = True
     server.scan_loop()
     assert pages.call_count == 2
     pause.assert_called_once_with(5)
     assert server.runtime["running"] is False
-with patch.object(server, "scan_pages", side_effect=[
-        server.HTTPException(504, "请求超时或网络错误：ReadTimeout"), None]) as pages, \
+server.stop_event.clear()
+server.runtime["stop_reason"] = None
+network_calls = []
+def network_then_stop():
+    network_calls.append(1)
+    if len(network_calls) == 1:
+        raise server.HTTPException(504, "请求超时或网络错误：ReadTimeout")
+    server.stop_event.set()
+with patch.object(server, "scan_pages", side_effect=network_then_stop) as pages, \
      patch.object(server.stop_event, "wait", return_value=False) as pause:
     server.runtime["running"] = True
     server.scan_loop()
     assert pages.call_count == 2
     pause.assert_called_once_with(30)
     assert server.runtime["running"] is False
+    assert server.runtime["stop_reason"] == "unknown_stop"
+server.control(server.Control(running=False))
+assert server.runtime["stop_reason"] == "stop_request"
+server.stop_event.clear()
+server.runtime["stop_reason"] = None
+unexpected_calls = []
+def return_then_stop():
+    unexpected_calls.append(1)
+    if len(unexpected_calls) == 2:
+        server.stop_event.set()
+with patch.object(server, "scan_pages", side_effect=return_then_stop) as pages, \
+     patch.object(server.stop_event, "wait", return_value=False) as pause:
+    server.runtime["running"] = True
+    server.scan_loop()
+    assert pages.call_count == 2
+    pause.assert_called_once_with(5)
 server.runtime["last_error"] = None
 server.runtime["phase"] = None
 server.stop_event.clear()
@@ -295,6 +326,7 @@ with server.db() as connection:
                              (timeout_sid,)).fetchone()
     assert row["status"] == "pending" and "ReadTimeout" in row["error"]
     connection.execute("UPDATE replays SET processed_at=0 WHERE sid=?", (timeout_sid,))
+assert "ReadTimeout" in server.runtime["last_notice"]
 http_timeout_sid = "eeeeeeeeeeeeeeeb"
 with patch.object(server, "download_last_part",
                   side_effect=server.HTTPException(504, "请求超时或网络错误：ReadTimeout")):

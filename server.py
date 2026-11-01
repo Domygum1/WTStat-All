@@ -77,7 +77,8 @@ worker_thread: threading.Thread | None = None
 next_maintenance_at = 0.0
 runtime = {"running": False, "stopping": False, "page": 1,
            "processed": 0, "errors": 0, "pending": 0, "samples": 0, "revision": 0,
-           "last_error": None, "cookie_expired": False, "phase": None, "active": 0}
+           "last_error": None, "last_notice": None, "stop_reason": None,
+           "cookie_expired": False, "phase": None, "active": 0}
 
 
 @contextmanager
@@ -104,6 +105,7 @@ def stop_for_rate_limit() -> None:
     """Keep the fatal reason visible while in-flight downloads finish."""
     with guard:
         stop_event.set()
+        runtime["stop_reason"] = "rate_limit"
         runtime["last_error"] = ("Gaijin 返回 429（请求过于频繁），采集已停止；"
                                  "请稍后重试，必要时调低“同时下载”。")
 
@@ -831,7 +833,9 @@ def record_error(sid: str, item: dict, error: str, *, pending: bool = False) -> 
             runtime["pending"] += 1
         elif new_status == "error" and old_status == "pending":
             runtime["pending"] = max(0, runtime["pending"] - 1)
-        if (not pending or error.startswith(NETWORK_RETRY_PREFIX)) and not stop_event.is_set():
+        if pending and error.startswith(NETWORK_RETRY_PREFIX):
+            runtime["last_notice"] = f"{sid}: {error}"
+        elif not pending and not stop_event.is_set():
             runtime["last_error"] = f"{sid}: {error}"
 
 
@@ -1006,6 +1010,7 @@ def process_replay(item: dict) -> None:
             runtime["revision"] += 1
             if not stop_event.is_set():
                 runtime["last_error"] = None
+                runtime["last_notice"] = None
     except HTTPException as error:
         if error.status_code == 429:
             stop_for_rate_limit()
@@ -1184,7 +1189,11 @@ def scan_loop() -> None:
         while not stop_event.is_set():
             try:
                 scan_pages()
-                break
+                if stop_event.is_set():
+                    break
+                with guard:
+                    runtime["phase"] = "扫描意外结束，5 秒后继续"
+                stop_event.wait(5)
             except HTTPException as error:
                 if error.status_code not in (408, 500, 502, 503, 504):
                     raise
@@ -1207,11 +1216,20 @@ def scan_loop() -> None:
         with guard:
             runtime["last_error"] = f"官网列表：{error.detail}"
             runtime["cookie_expired"] = error.status_code == 401
+            runtime["stop_reason"] = "cookie" if error.status_code == 401 else "list_error"
     except Exception as error:
         with guard:
             runtime["last_error"] = f"扫描中断：{type(error).__name__}: {error}"
+            runtime["stop_reason"] = "worker_error"
+    except BaseException as error:
+        with guard:
+            runtime["last_error"] = f"扫描线程异常终止：{type(error).__name__}: {error}"
+            runtime["stop_reason"] = "worker_error"
+        raise
     finally:
         with guard:
+            if runtime["stop_reason"] is None:
+                runtime["stop_reason"] = "unknown_stop" if stop_event.is_set() else "worker_ended"
             runtime["running"] = False
             runtime["stopping"] = False
             runtime["phase"] = None
@@ -1331,12 +1349,15 @@ def control(payload: Control):
                 runtime["running"] = True
                 runtime["stopping"] = False
                 runtime["last_error"] = None
+                runtime["last_notice"] = None
+                runtime["stop_reason"] = None
                 runtime["cookie_expired"] = False
                 runtime["phase"] = "正在验证官网登录"
                 worker_thread = threading.Thread(target=scan_loop, name="wtstat-all-scan", daemon=True)
                 worker_thread.start()
         else:
             stop_event.set()
+            runtime["stop_reason"] = "stop_request"
             runtime["stopping"] = bool(worker_thread and worker_thread.is_alive())
             runtime["running"] = False
     return status_data()
@@ -1438,7 +1459,8 @@ def clear_data():
             connection.execute("DELETE FROM battle.matches")
             connection.execute("UPDATE settings SET value='1' WHERE key='page'")
         runtime.update(page=1, processed=0, errors=0, pending=0, samples=0,
-                       last_error=None, cookie_expired=False, phase=None, active=0)
+                       last_error=None, last_notice=None, stop_reason=None,
+                       cookie_expired=False, phase=None, active=0)
         runtime["revision"] += 1
     return {"deleted_replays": deleted_replays, "deleted_samples": deleted_samples,
             "deleted_files": len(files), "status": status_data()}
