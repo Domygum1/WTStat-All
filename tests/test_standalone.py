@@ -178,6 +178,15 @@ with patch.object(server, "scan_pages", side_effect=[
     assert pages.call_count == 2
     pause.assert_called_once_with(5)
     assert server.runtime["running"] is False
+with patch.object(server, "scan_pages", side_effect=[
+        server.HTTPException(504, "请求超时或网络错误：ReadTimeout"), None]) as pages, \
+     patch.object(server.stop_event, "wait", return_value=False) as pause:
+    server.runtime["running"] = True
+    server.scan_loop()
+    assert pages.call_count == 2
+    pause.assert_called_once_with(30)
+    assert server.runtime["running"] is False
+server.runtime["last_error"] = None
 server.runtime["phase"] = None
 with patch.object(server, "process_replay", side_effect=[
         sqlite3.OperationalError("database is locked"), None]) as process, \
@@ -260,6 +269,34 @@ with server.db() as connection:
     assert connection.execute("SELECT COUNT(*) FROM samples WHERE sid=?",
                               (bot_only_sid,)).fetchone()[0] == 0
 assert server.runtime["processed"] == processed_before
+timeout_sid = "eeeeeeeeeeeeeeed"
+with patch.object(server, "download_last_part",
+                  side_effect=server.requests.exceptions.ReadTimeout("slow replay stream")):
+    server.process_replay({**bot_only_item, "sessionIdHex": timeout_sid})
+with server.db() as connection:
+    row = connection.execute("SELECT status,error FROM replays WHERE sid=?",
+                             (timeout_sid,)).fetchone()
+    assert row["status"] == "pending" and "ReadTimeout" in row["error"]
+    connection.execute("UPDATE replays SET processed_at=0 WHERE sid=?", (timeout_sid,))
+http_timeout_sid = "eeeeeeeeeeeeeeeb"
+with patch.object(server, "download_last_part",
+                  side_effect=server.HTTPException(504, "请求超时或网络错误：ReadTimeout")):
+    server.process_replay({**bot_only_item, "sessionIdHex": http_timeout_sid})
+with server.db() as connection:
+    assert connection.execute("SELECT status FROM replays WHERE sid=?",
+                              (http_timeout_sid,)).fetchone()[0] == "pending"
+with patch.object(server, "process_page") as retry:
+    server.retry_pending()
+    assert any(item["sessionIdHex"] == timeout_sid for item in retry.call_args.args[0])
+legacy_timeout_sid = "eeeeeeeeeeeeeeec"
+with server.db() as connection:
+    connection.execute("INSERT INTO replays(sid,group_name,last_part,status,error,processed_at) "
+                       "VALUES(?,'air',1,'error','ReadTimeout: old failure',0)",
+                       (legacy_timeout_sid,))
+server.init_db()
+with server.db() as connection:
+    assert connection.execute("SELECT status FROM replays WHERE sid=?",
+                              (legacy_timeout_sid,)).fetchone()[0] == "pending"
 unplayed_sid = "abababababababab"
 with patch.object(server, "download_last_part", return_value=Path("ignored.wrpl")), \
      patch.object(server.wt, "parse_replay", return_value={"players": [unspawned]}):
@@ -595,9 +632,11 @@ with patch.object(zipfile, "ZIP64_LIMIT", 128):
 """
             environment = os.environ.copy()
             environment.pop("PYTHONPATH", None)
+            smoke_test = isolated / "smoke_test.py"
+            smoke_test.write_text(script, encoding="utf-8")
             try:
                 completed = subprocess.run(
-                    [sys.executable, "-c", script], cwd=isolated, env=environment,
+                    [sys.executable, str(smoke_test)], cwd=isolated, env=environment,
                     text=True, capture_output=True, timeout=15,
                 )
             except subprocess.TimeoutExpired as error:

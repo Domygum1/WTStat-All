@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -61,6 +62,7 @@ MAX_PART_BYTES = 100_000_000
 MAX_IMPORT_BYTES = 300_000_000
 NO_PLAYERS = "结算段未包含玩家数据"
 NO_PARTICIPANTS = "结算段没有参战玩家"
+NETWORK_RETRY_PREFIX = "网络请求暂时失败："
 PLAYER_STAT_FIELDS = ("kills", "groundKills", "humanKills", "deaths", "assists", "score",
                       "aiKills", "aiGroundKills", "aiNavalKills", "captureZone", "teamKills")
 VALID_SAMPLE_SQL = ("uid <> '' AND uid NOT GLOB '*[^0-9]*' AND CAST(uid AS INTEGER)>0 "
@@ -210,8 +212,12 @@ def init_db() -> None:
         if not connection.execute("SELECT 1 FROM settings WHERE key='keep_files_default_100'").fetchone():
             connection.execute("UPDATE settings SET value='100' WHERE key='keep_files' AND value='10'")
             connection.execute("INSERT INTO settings VALUES('keep_files_default_100','1')")
-        connection.execute("UPDATE replays SET status='pending' WHERE status='error' "
-                           "AND error IN ('结算段 HTTP 404', '结算段未包含玩家数据')")
+        connection.execute(
+            "UPDATE replays SET status='pending' WHERE status='error' AND ("
+            "error IN ('结算段 HTTP 404', '结算段未包含玩家数据') OR "
+            "error LIKE 'ReadTimeout:%' OR error LIKE 'ConnectTimeout:%' OR "
+            "error LIKE 'ConnectionError:%' OR error LIKE 'ChunkedEncodingError:%' OR "
+            "error LIKE '请求超时或网络错误：%')")
         runtime["processed"] = connection.execute(
             "SELECT COUNT(*) FROM replays WHERE status='done'").fetchone()[0]
         runtime["errors"] = connection.execute(
@@ -822,8 +828,16 @@ def record_error(sid: str, item: dict, error: str, *, pending: bool = False) -> 
             runtime["pending"] += 1
         elif new_status == "error" and old_status == "pending":
             runtime["pending"] = max(0, runtime["pending"] - 1)
-        if not pending and not stop_event.is_set():
+        if (not pending or error.startswith(NETWORK_RETRY_PREFIX)) and not stop_event.is_set():
             runtime["last_error"] = f"{sid}: {error}"
+
+
+def retryable_replay_http_error(error: HTTPException) -> bool:
+    detail = str(error.detail)
+    return error.status_code in (408, 500, 502, 503, 504) and (
+        error.status_code in (408, 503, 504) or
+        detail.startswith(("请求超时或网络错误：", "结算段 HTTP ")) or
+        detail == "结算段不完整")
 
 
 def record_no_participants(sid: str, item: dict, player_count: int,
@@ -996,8 +1010,12 @@ def process_replay(item: dict) -> None:
             record_error(sid, item, "结算段暂不可用 (HTTP 404)，稍后重试", pending=True)
         elif error.detail == NO_PLAYERS:
             record_error(sid, item, NO_PLAYERS, pending=True)
+        elif retryable_replay_http_error(error):
+            record_error(sid, item, f"{NETWORK_RETRY_PREFIX}{error.detail}", pending=True)
         else:
             record_error(sid, item, str(error.detail))
+    except requests.RequestException as error:
+        record_error(sid, item, f"{NETWORK_RETRY_PREFIX}{type(error).__name__}", pending=True)
     except sqlite3.OperationalError as error:
         if database_is_locked(error):
             raise  # The page worker retries this session; it is not a bad replay.
@@ -1144,6 +1162,12 @@ def repair_old_missing_lineups() -> None:
                     "INSERT OR REPLACE INTO lineup_repair_attempts "
                     "(sid,checked_at,retryable) VALUES(?,?,1)",
                     (sid, time.time()))
+        except requests.RequestException:
+            with db() as connection:
+                connection.execute(
+                    "INSERT OR REPLACE INTO lineup_repair_attempts "
+                    "(sid,checked_at,retryable) VALUES(?,?,1)",
+                    (sid, time.time()))
     if changed:
         with db() as connection:
             rebuild_histogram(connection)
@@ -1158,6 +1182,18 @@ def scan_loop() -> None:
             try:
                 scan_pages()
                 break
+            except HTTPException as error:
+                if error.status_code not in (408, 500, 502, 503, 504):
+                    raise
+                with guard:
+                    runtime["last_error"] = f"官网暂时不可用：{error.detail}"
+                    runtime["phase"] = "官网请求失败，30 秒后重试"
+                stop_event.wait(30)
+            except requests.RequestException as error:
+                with guard:
+                    runtime["last_error"] = f"官网网络错误：{type(error).__name__}"
+                    runtime["phase"] = "官网请求失败，30 秒后重试"
+                stop_event.wait(30)
             except sqlite3.OperationalError as error:
                 if not database_is_locked(error):
                     raise
