@@ -57,7 +57,9 @@ app = FastAPI(title="WTStat all")
 GROUPS = {"aircraft": "air", "tank": "ground"}
 COUNTRIES = list(wt.COUNTRIES.values())
 PAGE_SIZE = 30
-PENDING_RETRY_BATCH = 15
+PENDING_RETRY_BATCH = 3
+LINEUP_REPAIR_BATCH = 2
+MAINTENANCE_INTERVAL_SECONDS = 60
 MAX_PART_BYTES = 100_000_000
 MAX_IMPORT_BYTES = 300_000_000
 NO_PLAYERS = "结算段未包含玩家数据"
@@ -72,6 +74,7 @@ db_write_guard = threading.Lock()
 stop_event = threading.Event()
 active_sids: set[str] = set()
 worker_thread: threading.Thread | None = None
+next_maintenance_at = 0.0
 runtime = {"running": False, "stopping": False, "page": 1,
            "processed": 0, "errors": 0, "pending": 0, "samples": 0, "revision": 0,
            "last_error": None, "cookie_expired": False, "phase": None, "active": 0}
@@ -1102,8 +1105,8 @@ def repair_old_missing_lineups() -> None:
             "AND r.group_name IN ('air','ground') "
             "AND (b.match_br_min IS NULL OR b.match_br_max IS NULL) "
             "AND (a.sid IS NULL OR (a.retryable=1 AND a.checked_at<?)) "
-            "ORDER BY r.processed_at DESC LIMIT 10",
-            (time.time() - 3600,)).fetchall()
+            "ORDER BY r.processed_at DESC LIMIT ?",
+            (time.time() - 3600, LINEUP_REPAIR_BATCH)).fetchall()
     changed = False
     for row in rows:
         if stop_event.is_set():
@@ -1215,6 +1218,7 @@ def scan_loop() -> None:
 
 
 def scan_pages() -> None:
+    global next_maintenance_at
     if stop_event.is_set():
         return
     # Check the authenticated listing before any potentially slow backlog work.
@@ -1223,17 +1227,19 @@ def scan_pages() -> None:
     latest_listing = fetch_page(1)
     pages_since_head = 20 if setting("page", 1) > 1 else 0
     while not stop_event.is_set():
-        # Give settled replays a bounded, concurrent retry batch before new pages.
-        with guard:
-            runtime["phase"] = "正在补试待结算战局"
-        retry_pending()
-        if stop_event.is_set():
-            break
-        with guard:
-            runtime["phase"] = "正在检查旧战局"
-        repair_old_missing_lineups()
-        if stop_event.is_set():
-            break
+        # Limit backlog traffic independently of the current download concurrency.
+        if time.monotonic() >= next_maintenance_at:
+            next_maintenance_at = time.monotonic() + MAINTENANCE_INTERVAL_SECONDS
+            with guard:
+                runtime["phase"] = "正在补试待结算战局"
+            retry_pending()
+            if stop_event.is_set():
+                break
+            with guard:
+                runtime["phase"] = "正在检查旧战局"
+            repair_old_missing_lineups()
+            if stop_event.is_set():
+                break
         page = setting("page", 1)
         if page > 1 and pages_since_head >= 20:
             with guard:

@@ -188,6 +188,23 @@ with patch.object(server, "scan_pages", side_effect=[
     assert server.runtime["running"] is False
 server.runtime["last_error"] = None
 server.runtime["phase"] = None
+server.stop_event.clear()
+server.save_setting("page", 1)
+server.next_maintenance_at = 0.0
+scanned_pages = []
+def stop_after_two_pages(_items):
+    scanned_pages.append(1)
+    if len(scanned_pages) == 2:
+        server.stop_event.set()
+with patch.object(server, "fetch_page", return_value={"items": [{}]}), \
+     patch.object(server, "retry_pending") as retry, \
+     patch.object(server, "repair_old_missing_lineups") as repair, \
+     patch.object(server, "process_page", side_effect=stop_after_two_pages):
+    server.scan_pages()
+    assert len(scanned_pages) == 2
+    assert retry.call_count == repair.call_count == 1
+server.stop_event.clear()
+server.save_setting("page", 1)
 with patch.object(server, "process_replay", side_effect=[
         sqlite3.OperationalError("database is locked"), None]) as process, \
      patch.object(server.stop_event, "wait", return_value=False):
