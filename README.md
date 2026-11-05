@@ -12,6 +12,12 @@ MySQL 是本机数据库的镜像：在网页中删除旧样本或清除所有�
 
 该 MySQL 库目前是**单台笔记本的镜像**。PC 上的 WTStat all 网页仍读取其自己的 SQLite；如需让 PC 网页直接查询 MySQL，须另行接入读取功能。配置文件包含数据库密码，已被 `.gitignore` 排除，不要提交或分享。更换 PC 或数据库账号后，程序会重新排队补传全部本地数据。若 PC 的 MySQL 数据库被清空而连接配置未变，先关闭采集窗口，再在笔记本运行 `resync_mysql.bat` 重新排队全部本地数据，随后重启采集程序。
 
+### 国家代码与英文名升级
+
+`samples` 在原有中文 `country`、`squad_countries` 之外，新增 `country_code`、`country_name`、`squad_country_codes`、`squad_country_names`。队友字段是与原列表顺序对应的 JSON 数组。无法确定科技树国家时，代码和英文名保持空值。网页现有中文筛选继续使用原字段；新导出的玩家 CSV 也带上四个新字段。美国 US、德国 DE、苏联 SU、英国 GB、日本 JP、意大利 IT、法国 FR、瑞典 SE、中国 CN、以色列 IL；SU 是苏联的历史两字母代码，GB 对应 United Kingdom。
+
+升级时，先在 PC 更新本仓库并重新运行 `setup_mysql_server.bat`，以给现有 MySQL `samples` 表加列；设置 `wt_collector` 密码时请使用笔记本配置中的现有密码，否则也要同步修改笔记本的 `mysql_sync.local.json`。然后在笔记本更新仓库并重启 `start.bat`。启动时会一次性回填笔记本本地 `data/wtstat_all.sqlite3` 中的旧样本，新采集和新导入的数据也会填写新字段。已经启用 MySQL 镜像的笔记本会把变更排入待上传队列，连接正常后逐步更新 PC 的 MySQL 记录；旧数据多时，首次启动和补传可能较慢。Git 不跟踪 SQLite 数据库，单独执行 `git pull` 不会改动本地旧记录。PC 上 WTStat all 自己的 SQLite 如也需要升级，须在 PC 启动其更新后的程序；它与笔记本上传的 MySQL 库是分开的。
+
 官网 Replay 增量统计工具，Windows 下可单独安装和运行，无需原 `WTStat` 项目。把本仓库放在任意目录，双击 `start.bat`，访问 <http://127.0.0.1:8767>。首次运行需要 Python 3 和网络来安装 `requirements.txt` 中的依赖；之后使用本目录的 `.venv`。Replay 解析器、载具表和字体均随本仓库提供。普通 WTStat 如已安装，可同时在 8766 端口运行。
 
 采集窗口标题显示 `WTStat ALL - Replay Sampler - Port 8767`。关闭采集窗口会停止采集，但已保存的样本保留；重新运行本目录的 `start.bat` 后，在网页点击“开始采集”即可继续。

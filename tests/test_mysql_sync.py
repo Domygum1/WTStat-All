@@ -99,10 +99,20 @@ class MySQLSyncTest(unittest.TestCase):
         mysql_sync.install_outbox(self.main, self.battle, self.config)
         self.assertEqual(mysql_sync._pending_count(self.main, self.battle), 0)
         with closing(sqlite3.connect(self.main)) as db:
-            db.execute("UPDATE samples SET player_name='changed' WHERE sid='abc' AND uid='123'")
+            db.execute("UPDATE samples SET player_name='changed',country_code='CN',"
+                       "country_name='China',squad_country_codes='[\"US\"]',"
+                       "squad_country_names='[\"United States\"]' "
+                       "WHERE sid='abc' AND uid='123'")
             db.commit()
         self.assertEqual(mysql_sync._pending_count(self.main, self.battle), 1)
         self.assertEqual(mysql_sync.sync_batch(self.main, self.battle, remote), 1)
+        sample_inserts = [(sql, rows) for sql, rows in remote.statements
+                          if sql.startswith("INSERT INTO `samples`")]
+        sql, rows = sample_inserts[-1]
+        self.assertIn("`country_code`", sql)
+        self.assertIn("`squad_country_names`", sql)
+        self.assertEqual(rows[0][mysql_sync.SAMPLE_COLUMNS.index("country_code")], "CN")
+        self.assertEqual(rows[0][mysql_sync.SAMPLE_COLUMNS.index("country_name")], "China")
         self.assertEqual(mysql_sync._pending_count(self.main, self.battle), 0)
         with closing(sqlite3.connect(self.main)) as db:
             db.execute("DELETE FROM samples WHERE sid='abc' AND uid='123'")

@@ -15,6 +15,8 @@ RESOURCES = (
     "server.py",
     "replay_core.py",
     "gaijin_login.py",
+    "country_codes.py",
+    "mysql_sync.py",
     "static/index.html",
     "static/fonts/symbols_skyquake.bfc9728c6a6bc73f209a.ttf",
     "data/wiki_vehicles.csv",
@@ -357,7 +359,9 @@ with server.db() as connection:
                               (unplayed_sid,)).fetchone()[0] == 0
 with sqlite3.connect(":memory:") as connection:
     connection.execute("CREATE TABLE samples (sid TEXT,uid TEXT,player_name TEXT,"
-                       "country TEXT,squad_br REAL,squad_countries TEXT,party_key TEXT,"
+                       "country TEXT,country_code TEXT,country_name TEXT,squad_br REAL,"
+                       "squad_countries TEXT,squad_country_codes TEXT,"
+                       "squad_country_names TEXT,party_key TEXT,"
                        "configured_vehicles TEXT,stats_json TEXT,team INTEGER)")
     connection.execute("CREATE TABLE replays (sid TEXT PRIMARY KEY, br_ceiling_tick INTEGER)")
     connection.execute("INSERT INTO replays VALUES('a',147)")
@@ -372,7 +376,7 @@ with sqlite3.connect(":memory:") as connection:
     ])
     rows = list(server.player_csv_rows(connection))
     assert [row[1] for row in rows[1:]] == ["123", "124", "125"]
-    assert all(row[-1] == 147 for row in rows[1:])
+    assert all(row[rows[0].index("br_ceiling_tick")] == 147 for row in rows[1:])
 with server.db() as connection:
     connection.executemany(
         "INSERT INTO samples(sid,uid,player_name,mode,squad_br,match_br) VALUES(?,?,?,?,?,?)",
@@ -396,7 +400,10 @@ with path.open("w", newline="", encoding="utf-8") as file:
     for uid, name in [("-13", "player"), ("0", "player"),
                       ("125", "coop/Bot57"), ("126", "real_player")]:
         writer.writerow({"session_id": "abcdef0123456789", "uid": uid,
-                         "player_name": name, "mode": "air"})
+                         "player_name": name, "mode": "air",
+                         "research_country": "中国" if uid == "126" else "",
+                         "teammate_research_countries_json": '["美国", "苏联"]'
+                         if uid == "126" else ""})
     writer.writerow({"session_id": "abcdef0123456789", "uid": "127",
                      "player_name": "unjoined", "mode": "air", "team": 2,
                      "stats_json": '{"score":0,"kills":0}'})
@@ -405,6 +412,11 @@ assert result["imported_samples"] == 1
 assert result["skipped_samples"] == 4
 with server.db() as connection:
     assert connection.execute("SELECT br_ceiling_tick FROM replays WHERE sid='abcdef0123456789'").fetchone()[0] == 147
+    imported = connection.execute(
+        "SELECT country_code,country_name,squad_country_codes,squad_country_names "
+        "FROM samples WHERE sid='abcdef0123456789' AND uid='126'").fetchone()
+    assert tuple(imported) == ("CN", "China", '["US", "SU"]',
+                               '["United States", "Soviet Union"]')
 with server.db() as connection:
     assert [row[0] for row in connection.execute(
         "SELECT uid FROM samples ORDER BY uid")] == ["123", "126"]
@@ -651,11 +663,16 @@ with server.db() as connection:
                               (short_sid,)).fetchone()[0] == "done"
     assert connection.execute("SELECT COUNT(*) FROM samples WHERE sid=?",
                               (short_sid,)).fetchone()[0] == 2
+    saved_country = connection.execute(
+        "SELECT country,country_code,country_name FROM samples WHERE sid=? AND uid='1'",
+        (new_sid,)).fetchone()
+    assert tuple(saved_country) == ("美国", "US", "United States")
     assert connection.execute("SELECT br_ceiling_tick FROM replays WHERE sid=?",
                               (new_sid,)).fetchone()[0] == 150
     exported = list(server.player_csv_rows(connection))
-    assert exported[0][-1] == "br_ceiling_tick"
-    assert all(row[-1] == 150 for row in exported[1:] if row[0] == new_sid)
+    assert "br_ceiling_tick" in exported[0]
+    assert all(row[exported[0].index("br_ceiling_tick")] == 150
+               for row in exported[1:] if row[0] == new_sid)
     connection.execute("INSERT INTO replays(sid,mode,group_name,status,processed_at) "
                        "VALUES('abababababababad','realistic','air','done',0)")
     connection.execute("DELETE FROM settings WHERE key='sid_width_rescan_v1'")

@@ -29,6 +29,14 @@ def main() -> None:
             cursor.execute("USE `wtstat_all`")
             for statement in SCHEMA:
                 cursor.execute(statement)
+            cursor.execute("SHOW COLUMNS FROM `samples`")
+            columns = {row[0] for row in cursor.fetchall()}
+            for name, field_type in (("country_code", "CHAR(2)"),
+                                     ("country_name", "VARCHAR(64)"),
+                                     ("squad_country_codes", "LONGTEXT"),
+                                     ("squad_country_names", "LONGTEXT")):
+                if name not in columns:
+                    cursor.execute(f"ALTER TABLE `samples` ADD COLUMN `{name}` {field_type}")
             cursor.execute("CREATE USER IF NOT EXISTS %s@%s IDENTIFIED BY %s",
                            ("wt_collector", laptop_ip, collector_password))
             cursor.execute("ALTER USER %s@%s IDENTIFIED BY %s",

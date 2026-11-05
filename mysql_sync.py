@@ -20,9 +20,10 @@ MATCH_COLUMNS = ("sid", "start_utc", "map", "mode", "player_count", "last_part",
                  "processed_at", "match_br_min", "match_br_max", "team1_br_min",
                  "team1_br_max", "team1_average_squad_br", "team2_br_min",
                  "team2_br_max", "team2_average_squad_br")
-SAMPLE_COLUMNS = ("sid", "uid", "player_name", "country", "squad_br", "match_br",
-                  "mode", "squad_countries", "party_key", "configured_vehicles",
-                  "stats_json", "team")
+SAMPLE_COLUMNS = ("sid", "uid", "player_name", "country", "country_code",
+                  "country_name", "squad_br", "match_br", "mode", "squad_countries",
+                  "squad_country_codes", "squad_country_names", "party_key",
+                  "configured_vehicles", "stats_json", "team")
 
 CONFIG_NAME = "mysql_sync.local.json"
 _state_lock = threading.Lock()

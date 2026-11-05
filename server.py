@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parent
 import replay_core as wt
 import gaijin_login
 import mysql_sync
+from country_codes import country_pair, migrate_samples, squad_pairs
 
 if not wt.wiki_catalog():
     raise RuntimeError("缺少本目录 data/wiki_vehicles.csv 或载具表无效。")
@@ -186,8 +187,10 @@ def init_db() -> None:
                            "WHERE br_ceiling_tick IS NULL AND status='done'")
         connection.execute("CREATE TABLE IF NOT EXISTS samples ("
                            "sid TEXT NOT NULL, uid TEXT NOT NULL, player_name TEXT, country TEXT, "
+                           "country_code TEXT, country_name TEXT, "
                            "squad_br REAL, match_br REAL, mode TEXT NOT NULL, "
-                           "squad_countries TEXT, party_key TEXT, "
+                           "squad_countries TEXT, squad_country_codes TEXT, "
+                           "squad_country_names TEXT, party_key TEXT, "
                            "PRIMARY KEY(sid,uid))")
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(samples)")}
         if "squad_countries" not in columns:
@@ -200,6 +203,7 @@ def init_db() -> None:
             connection.execute("ALTER TABLE samples ADD COLUMN stats_json TEXT")
         if "team" not in columns:
             connection.execute("ALTER TABLE samples ADD COLUMN team INTEGER")
+        migrate_samples(connection)
         connection.execute("CREATE INDEX IF NOT EXISTS samples_filter ON samples(mode,squad_br,country)")
         connection.execute("CREATE INDEX IF NOT EXISTS samples_uid ON samples(uid)")
         connection.execute("CREATE TABLE IF NOT EXISTS histogram ("
@@ -963,13 +967,18 @@ def process_replay(item: dict) -> None:
             teammate_countries = squad_countries(real_players)
             for player in real_players:
                 country = player_country(player)
+                teammate_json = teammate_countries[str(player["uid"])]
+                country_code, country_name = country_pair(country)
+                squad_codes, squad_names = squad_pairs(teammate_json)
                 squad_br = player.get("squad_br")
                 cursor = connection.execute(
                     "INSERT OR IGNORE INTO samples "
-                    "(sid,uid,player_name,country,squad_br,match_br,mode,squad_countries,party_key,"
-                    "configured_vehicles,stats_json,team) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (sid, str(player["uid"]), player.get("name"), country,
-                     squad_br, match_br, mode, teammate_countries[str(player["uid"])], party_key(player),
+                    "(sid,uid,player_name,country,country_code,country_name,squad_br,match_br,"
+                    "mode,squad_countries,squad_country_codes,squad_country_names,party_key,"
+                    "configured_vehicles,stats_json,team) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (sid, str(player["uid"]), player.get("name"), country, country_code,
+                     country_name, squad_br, match_br, mode, teammate_json, squad_codes,
+                     squad_names, party_key(player),
                      json.dumps(player.get("configured"), ensure_ascii=False) if player.get("configured") else None,
                      json.dumps({key: player.get(key) for key in PLAYER_STAT_FIELDS}, ensure_ascii=False),
                      player.get("team")))
@@ -1142,13 +1151,18 @@ def repair_old_missing_lineups() -> None:
                 connection.execute("DELETE FROM samples WHERE sid=?", (sid,))
                 for player in players:
                     uid = str(player["uid"])
+                    country = player_country(player)
+                    teammate_json = teammate_countries[uid]
+                    country_code, country_name = country_pair(country)
+                    squad_codes, squad_names = squad_pairs(teammate_json)
                     connection.execute(
-                        "INSERT INTO samples(sid,uid,player_name,country,squad_br,"
-                        "match_br,mode,squad_countries,party_key,configured_vehicles,"
-                        "stats_json,team) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (sid, uid, player.get("name"), player_country(player),
+                        "INSERT INTO samples(sid,uid,player_name,country,country_code,"
+                        "country_name,squad_br,match_br,mode,squad_countries,"
+                        "squad_country_codes,squad_country_names,party_key,configured_vehicles,"
+                        "stats_json,team) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (sid, uid, player.get("name"), country, country_code, country_name,
                          player.get("squad_br"), match_br, row["group_name"],
-                         teammate_countries[uid], party_key(player),
+                         teammate_json, squad_codes, squad_names, party_key(player),
                          json.dumps(player.get("configured"), ensure_ascii=False)
                          if player.get("configured") else None,
                          json.dumps({key: player.get(key) for key in PLAYER_STAT_FIELDS},
@@ -1891,13 +1905,15 @@ def recent_detail(sid: str):
                 pass  # Existing saved data remains available if the old file is unreadable.
     with db() as connection:
         rows = connection.execute(
-            "SELECT uid,player_name,country,squad_br,match_br,team,squad_countries,party_key,"
+            "SELECT uid,player_name,country,country_code,country_name,squad_br,match_br,"
+            "team,squad_countries,squad_country_codes,squad_country_names,party_key,"
             "configured_vehicles,stats_json FROM samples WHERE sid=? "
             "ORDER BY player_name COLLATE NOCASE,uid", (sid,)).fetchall()
     players = []
     for row in rows:
         player = dict(row)
-        for field in ("squad_countries", "configured_vehicles", "stats_json"):
+        for field in ("squad_countries", "squad_country_codes", "squad_country_names",
+                      "configured_vehicles", "stats_json"):
             try:
                 player[field] = json.loads(player[field]) if player[field] is not None else None
             except (TypeError, ValueError):
@@ -1910,11 +1926,14 @@ def recent_detail(sid: str):
 def player_csv_rows(connection: sqlite3.Connection):
     yield ("session_id", "uid", "player_name", "research_country", "squad_br",
            "teammate_research_countries_json", "party_key", "configured_vehicles_json",
-           "stats_json", "team", "br_ceiling_tick")
+           "stats_json", "team", "br_ceiling_tick", "research_country_code",
+           "research_country_name", "teammate_research_country_codes_json",
+           "teammate_research_country_names_json")
     for row in connection.execute(
         "SELECT sid,uid,player_name,country,squad_br,squad_countries,party_key,"
         "configured_vehicles,stats_json,team,"
-        "(SELECT br_ceiling_tick FROM replays WHERE replays.sid=samples.sid) FROM samples "
+        "(SELECT br_ceiling_tick FROM replays WHERE replays.sid=samples.sid),"
+        "country_code,country_name,squad_country_codes,squad_country_names FROM samples "
         f"WHERE {VALID_SAMPLE_SQL} ORDER BY sid,uid"):
         yield tuple(row)
 
@@ -2074,6 +2093,8 @@ def import_csv_file(path: Path) -> dict:
                     if match_br is None and battle:
                         match_br = battle["match_br_max"]
                     teammates = json_field(row["teammate_research_countries_json"], line, "队友国籍", list)
+                    country_code, country_name = country_pair(country)
+                    squad_codes, squad_names = squad_pairs(teammates)
                     vehicles = json_field(row["configured_vehicles_json"], line, "配置载具", list)
                     stats = json_field(row["stats_json"], line, "战绩", dict)
                     team = integer(row["team"], line, "team", 0, 2)
@@ -2140,10 +2161,13 @@ def import_csv_file(path: Path) -> dict:
                                 processed_at, match_br, team_br_json), only_missing=True)
                     cursor = connection.execute(
                         "INSERT OR IGNORE INTO samples "
-                        "(sid,uid,player_name,country,squad_br,match_br,mode,squad_countries,"
-                        "party_key,configured_vehicles,stats_json,team) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (sid, uid, name, country, squad_br, match_br, mode,
-                         teammates, party_key, vehicles, stats, team))
+                        "(sid,uid,player_name,country,country_code,country_name,squad_br,"
+                        "match_br,mode,squad_countries,squad_country_codes,squad_country_names,"
+                        "party_key,configured_vehicles,stats_json,team) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (sid, uid, name, country, country_code, country_name, squad_br,
+                         match_br, mode, teammates, squad_codes, squad_names, party_key,
+                         vehicles, stats, team))
                     if cursor.rowcount:
                         imported_samples += 1
                         squad_tick = rating_tick(squad_br, mode)

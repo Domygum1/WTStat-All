@@ -21,9 +21,11 @@ SCHEMA = (
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS `samples` (
       `sid` VARCHAR(16) NOT NULL, `uid` VARCHAR(64) NOT NULL,
-      `player_name` TEXT, `country` VARCHAR(128), `squad_br` DOUBLE,
+      `player_name` TEXT, `country` VARCHAR(128),
+      `country_code` CHAR(2), `country_name` VARCHAR(64), `squad_br` DOUBLE,
       `match_br` DOUBLE, `mode` VARCHAR(16) NOT NULL,
-      `squad_countries` LONGTEXT, `party_key` TEXT,
+      `squad_countries` LONGTEXT, `squad_country_codes` LONGTEXT,
+      `squad_country_names` LONGTEXT, `party_key` TEXT,
       `configured_vehicles` LONGTEXT, `stats_json` LONGTEXT, `team` INT,
       PRIMARY KEY (`sid`,`uid`), INDEX `samples_uid` (`uid`),
       INDEX `samples_filter` (`mode`,`squad_br`,`country`)
