@@ -94,6 +94,8 @@ class MySQLSyncTest(unittest.TestCase):
         self.assertEqual(mysql_sync.sync_batch(self.main, self.battle, remote), 1)
         self.assertEqual(remote.commits, 1)
         self.assertEqual(mysql_sync._pending_count(self.main, self.battle), 0)
+        self.assertEqual(mysql_sync.sync_batch(self.main, self.battle, remote), 0)
+        self.assertEqual(remote.commits, 1)
         mysql_sync.install_outbox(self.main, self.battle, self.config)
         self.assertEqual(mysql_sync._pending_count(self.main, self.battle), 0)
         with closing(sqlite3.connect(self.main)) as db:
@@ -121,6 +123,23 @@ class MySQLSyncTest(unittest.TestCase):
         remote = ChangingRemote(self.main)
         self.assertEqual(mysql_sync.sync_batch(self.main, self.battle, remote), 1)
         self.assertEqual(mysql_sync._pending_count(self.main, self.battle), 1)
+
+    def test_multiple_sessions_use_one_remote_commit(self):
+        with closing(sqlite3.connect(self.main)) as db:
+            db.execute("INSERT INTO replays(sid,status,processed_at) VALUES('def','done',2)")
+            db.execute("INSERT INTO samples(sid,uid,mode) VALUES('def','456','ground')")
+            db.commit()
+        with closing(sqlite3.connect(self.battle)) as db:
+            db.execute("INSERT INTO matches(sid,mode) VALUES('def','ground')")
+            db.commit()
+        mysql_sync.install_outbox(self.main, self.battle, self.config)
+        remote = FakeRemote()
+        self.assertEqual(mysql_sync.sync_batch(self.main, self.battle, remote), 2)
+        self.assertEqual(remote.commits, 1)
+        self.assertEqual(mysql_sync._pending_count(self.main, self.battle), 0)
+        deletes = [sql for sql, _ in remote.statements if sql.startswith("DELETE")]
+        self.assertEqual(len(deletes), 3)
+        self.assertTrue(all("IN (%s,%s)" in sql for sql in deletes))
 
 
 if __name__ == "__main__":

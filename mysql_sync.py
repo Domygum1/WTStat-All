@@ -140,9 +140,10 @@ def _rows(connection: sqlite3.Connection, table: str, columns: tuple[str, ...], 
         f"SELECT {','.join(columns)} FROM {table} WHERE sid=?", (sid,))]
 
 
-def _replace_remote(cursor, table: str, columns: tuple[str, ...], sid: str,
-                    rows: list[tuple]) -> None:
-    cursor.execute(f"DELETE FROM `{table}` WHERE sid=%s", (sid,))
+def _replace_remote_batch(cursor, table: str, columns: tuple[str, ...],
+                          sids: list[str], rows: list[tuple]) -> None:
+    sid_placeholders = ",".join(["%s"] * len(sids))
+    cursor.execute(f"DELETE FROM `{table}` WHERE sid IN ({sid_placeholders})", tuple(sids))
     if rows:
         fields = ",".join(f"`{column}`" for column in columns)
         placeholders = ",".join(["%s"] * len(columns))
@@ -150,32 +151,41 @@ def _replace_remote(cursor, table: str, columns: tuple[str, ...], sid: str,
 
 
 def sync_batch(main_db: Path, battle_db: Path, remote, limit: int = 40) -> int:
-    """Commit remote data before acknowledging each unchanged outbox generation."""
+    """Send many sessions per transaction, then acknowledge unchanged generations."""
     with _local_connection(main_db, battle_db) as local:
         batch = _pending(local, limit)
-    for sid, main_generation, battle_generation in batch:
-        with _local_connection(main_db, battle_db) as local:
+        if not batch:
+            return 0
+        sids = [sid for sid, _, _ in batch]
+        replays = []
+        matches = []
+        samples = []
+        for sid in sids:
             replay = _row(local, "replays", REPLAY_COLUMNS, sid)
             match = _row(local, "battle.matches", MATCH_COLUMNS, sid)
-            samples = _rows(local, "samples", SAMPLE_COLUMNS, sid)
-        cursor = remote.cursor()
-        try:
-            _replace_remote(cursor, "samples", SAMPLE_COLUMNS, sid, samples)
-            _replace_remote(cursor, "matches", MATCH_COLUMNS, sid, [match] if match else [])
-            _replace_remote(cursor, "replays", REPLAY_COLUMNS, sid, [replay] if replay else [])
-            remote.commit()
-        except Exception:
-            remote.rollback()
-            raise
-        finally:
-            cursor.close()
-        with _local_connection(main_db, battle_db) as local:
-            if main_generation is not None:
-                local.execute("DELETE FROM mysql_sync_outbox WHERE sid=? AND generation=?",
-                              (sid, main_generation))
-            if battle_generation is not None:
-                local.execute("DELETE FROM battle.mysql_sync_outbox WHERE sid=? AND generation=?",
-                              (sid, battle_generation))
+            if replay:
+                replays.append(replay)
+            if match:
+                matches.append(match)
+            samples.extend(_rows(local, "samples", SAMPLE_COLUMNS, sid))
+    cursor = remote.cursor()
+    try:
+        _replace_remote_batch(cursor, "samples", SAMPLE_COLUMNS, sids, samples)
+        _replace_remote_batch(cursor, "matches", MATCH_COLUMNS, sids, matches)
+        _replace_remote_batch(cursor, "replays", REPLAY_COLUMNS, sids, replays)
+        remote.commit()
+    except Exception:
+        remote.rollback()
+        raise
+    finally:
+        cursor.close()
+    with _local_connection(main_db, battle_db) as local:
+        local.executemany("DELETE FROM mysql_sync_outbox WHERE sid=? AND generation=?",
+                          ((sid, generation) for sid, generation, _ in batch
+                           if generation is not None))
+        local.executemany("DELETE FROM battle.mysql_sync_outbox WHERE sid=? AND generation=?",
+                          ((sid, generation) for sid, _, generation in batch
+                           if generation is not None))
     return len(batch)
 
 
