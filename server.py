@@ -26,6 +26,7 @@ from starlette.background import BackgroundTask
 ROOT = Path(__file__).resolve().parent
 import replay_core as wt
 import gaijin_login
+import mysql_sync
 
 if not wt.wiki_catalog():
     raise RuntimeError("缺少本目录 data/wiki_vehicles.csv 或载具表无效。")
@@ -1301,7 +1302,18 @@ def status_data() -> dict:
     snapshot["saved_files"] = sum(1 for _ in CACHE.glob("*/*.wrpl"))
     snapshot["cookie_configured"] = bool(wt.cookie())
     snapshot["auto_login_configured"] = gaijin_login.configured()
+    snapshot["mysql_sync"] = mysql_sync.status()
     return snapshot
+
+
+@app.on_event("startup")
+def start_mysql_sync() -> None:
+    mysql_sync.start(ROOT, DB, BATTLE_DB)
+
+
+@app.on_event("shutdown")
+def stop_mysql_sync() -> None:
+    mysql_sync.stop()
 
 
 class Control(BaseModel):

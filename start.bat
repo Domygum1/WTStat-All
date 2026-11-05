@@ -14,6 +14,7 @@ if errorlevel 1 (
   "%PYTHON_EXE%" -m pip install -r requirements.txt
   if errorlevel 1 goto :fail
 )
+"%PYTHON_EXE%" bootstrap_mysql_sync.py
 if not exist "bin\wtstat_results.exe" (
   echo Missing local Replay parser: bin\wtstat_results.exe
   goto :fail

@@ -1,5 +1,17 @@
 # WTStat all
 
+## 可选：持续上传到 PC 的 MySQL
+
+默认只使用本机 SQLite；不创建 `mysql_sync.local.json`，或文件中的 `host` 留空时，上传完全关闭，原有采集和统计照常运行。笔记本无需安装 MySQL Server 或 MySQL Shell。`host` 应填写**运行 MySQL 的 PC 的 Radmin VPN IP**，不是笔记本自己的 IP。
+
+首次使用时，在 PC 上运行本目录的 `setup_mysql_server.bat`。它会提示输入 PC 的 MySQL root 密码、笔记本的 Radmin VPN IP，并让你设置 `wt_collector` 的密码；脚本自动创建 `wtstat_all` 数据库、`replays`、`matches`、`samples` 三张表及仅允许该笔记本地址登录的采集账号，无需手动输入 SQL。PC 的 Windows 防火墙仍需只允许笔记本 Radmin VPN IP 访问 TCP 3306。若数据库和账号已按旧说明创建，也运行一次此脚本建表；脚本会将采集账号密码更新为这次输入的值。
+
+在**笔记本**上把 `mysql_sync.local.example.json` 复制为 `mysql_sync.local.json`，在 `host` 填 PC 的 Radmin VPN IP，在 `password` 填刚设置的采集账号密码。其余字段通常保持默认。重启 `start.bat` 后，仅在配置启用时自动安装可选的 MySQL Python 驱动。网页顶部会显示 MySQL 上传连接状态和待上传数量；连接失败不会停止本地采集，恢复后会重试。首次启用会补传本机已有数据，之后每次新增、修改或删除对局及玩家样本都进入本机待上传队列；同一 Session 的上传可安全重试。MySQL 中保存对局元数据和玩家样本，不上传 `.wrpl` Replay 文件、Cookie 或登录密码。
+
+MySQL 是本机数据库的镜像：在网页中删除旧样本或清除所有数据时，远端相应记录也会删除；如果当时断线，恢复连接后再执行删除。清除数据前请同时考虑 PC 上的镜像。
+
+该 MySQL 库目前是**单台笔记本的镜像**。PC 上的 WTStat all 网页仍读取其自己的 SQLite；如需让 PC 网页直接查询 MySQL，须另行接入读取功能。配置文件包含数据库密码，已被 `.gitignore` 排除，不要提交或分享。更换 PC 或数据库账号后，程序会重新排队补传全部本地数据。若 PC 的 MySQL 数据库被清空而连接配置未变，先关闭采集窗口，再在笔记本运行 `resync_mysql.bat` 重新排队全部本地数据，随后重启采集程序。
+
 官网 Replay 增量统计工具，Windows 下可单独安装和运行，无需原 `WTStat` 项目。把本仓库放在任意目录，双击 `start.bat`，访问 <http://127.0.0.1:8767>。首次运行需要 Python 3 和网络来安装 `requirements.txt` 中的依赖；之后使用本目录的 `.venv`。Replay 解析器、载具表和字体均随本仓库提供。普通 WTStat 如已安装，可同时在 8766 端口运行。
 
 采集窗口标题显示 `WTStat ALL - Replay Sampler - Port 8767`。关闭采集窗口会停止采集，但已保存的样本保留；重新运行本目录的 `start.bat` 后，在网页点击“开始采集”即可继续。

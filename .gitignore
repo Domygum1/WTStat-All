@@ -4,6 +4,7 @@ __pycache__/
 config.local.json
 config.local.json.tmp
 login.local.json
+mysql_sync.local.json
 data/*.sqlite3*
 cache/replays/
 work/
