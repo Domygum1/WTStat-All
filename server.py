@@ -1559,33 +1559,29 @@ def party_distribution(mode: str, composition_filter: tuple[str, ...] | None,
     known: dict[tuple[str, str], list] = {}
     legacy: Counter[tuple] = Counter()
     with db() as connection:
+        # Aggregate while streaming rows: SQLite's GROUP BY over the computed
+        # match BR can spill a large temporary B-tree onto a full disk.
         minima = {}
-        for row in connection.execute(
-            "SELECT s.sid, COALESCE(r.match_br,s.match_br) AS maximum, "
-            "MIN(CASE WHEN s.squad_br BETWEEN "
-            "MAX(1.0,COALESCE(r.match_br,s.match_br)-1.0)-0.0001 "
-            "AND COALESCE(r.match_br,s.match_br)+0.0001 "
-            "AND ABS(s.squad_br*10-ROUND(s.squad_br*10))<0.001 "
-            "AND CAST(ROUND(s.squad_br*10) AS INTEGER)%10 IN (0,3,7) "
-            "THEN s.squad_br END) AS minimum, "
-            "MAX(r.br_ceiling_tick) AS ceiling "
-            "FROM samples s LEFT JOIN replays r ON r.sid=s.sid "
-            "WHERE s.mode=?" +
-            time_clause + " GROUP BY s.sid,COALESCE(r.match_br,s.match_br)",
-            (mode, *time_params)
-        ):
-            high = rating_tick(row["maximum"], mode)
-            if high is not None:
-                minima[(row["sid"], high)] = (
-                    rating_tick(row["minimum"], mode) or max(10, high - 10),
-                    row["ceiling"] or BR_CEILINGS[mode])
         rows = connection.execute(
             "SELECT s.sid,s.country,s.squad_br,"
             "COALESCE(r.match_br,s.match_br) AS match_br,"
-            "s.squad_countries,s.party_key "
+            "s.squad_countries,s.party_key,r.br_ceiling_tick AS ceiling "
             "FROM samples s LEFT JOIN replays r ON r.sid=s.sid "
             "WHERE s.mode=?" + time_clause, (mode, *time_params))
         for row in rows:
+            high = rating_tick(row["match_br"], mode)
+            if high is not None:
+                key = (row["sid"], high)
+                low = rating_tick(row["squad_br"], mode)
+                if low is None or not max(10, high - 10) <= low <= high:
+                    low = None
+                previous_low, previous_ceiling = minima.get(key, (None, None))
+                if low is not None and (previous_low is None or low < previous_low):
+                    previous_low = low
+                if row["ceiling"] is not None and (
+                        previous_ceiling is None or row["ceiling"] > previous_ceiling):
+                    previous_ceiling = row["ceiling"]
+                minima[key] = (previous_low, previous_ceiling)
             if row["squad_countries"] is None:
                 continue
             try:
@@ -1607,6 +1603,10 @@ def party_distribution(mode: str, composition_filter: tuple[str, ...] | None,
                 entry[2] = entry[2] and entry[0] == signature
             else:
                 legacy[(row["sid"], signature)] += 1
+
+    minima = {key: (low if low is not None else max(10, key[1] - 10),
+                    ceiling or BR_CEILINGS[mode])
+              for key, (low, ceiling) in minima.items()}
 
     grouped: dict[int, Counter[int]] = defaultdict(Counter)
     classified: dict[int, Counter[str]] = defaultdict(Counter)
